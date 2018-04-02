@@ -1,10 +1,6 @@
-
-
 import logging
 import math
 import os
-from abc import abstractproperty, abstractmethod
-from copy import deepcopy
 from typing import Type
 
 from PIL import Image, ImageChops
@@ -12,18 +8,18 @@ from pathlib import Path
 
 from apps.core.task.coretask import CoreTask, CoreTaskBuilder
 from apps.rendering.resources.imgrepr import load_as_pil
+from apps.rendering.resources.utils import handle_image_error, handle_none
 from apps.rendering.task.renderingtaskstate import RendererDefaults
-from apps.rendering.task.verificator import RenderingVerificator
-from golem.core.common import get_golem_path, timeout_to_deadline
+from apps.rendering.task.verifier import RenderingVerifier
+from golem.core.common import get_golem_path
 from golem.core.fileshelper import format_cmd_line_path
 from golem.core.simpleexccmd import is_windows, exec_cmd
 from golem.docker.environment import DockerEnvironment
 from golem.docker.job import DockerJob
-from golem.task.taskbase import ComputeTaskDef
 from golem.task.taskstate import SubtaskStatus
 
-MIN_TIMEOUT = 2200.0
-SUBTASK_TIMEOUT = 220.0
+MIN_TIMEOUT = 60
+SUBTASK_MIN_TIMEOUT = 60
 PREVIEW_EXT = "PNG"
 PREVIEW_X = 1280
 PREVIEW_Y = 720
@@ -32,7 +28,7 @@ logger = logging.getLogger("apps.rendering")
 
 class RenderingTask(CoreTask):
 
-    VERIFICATOR_CLASS = RenderingVerificator
+    VERIFIER_CLASS = RenderingVerifier
     ENVIRONMENT_CLASS = None # type: Type[DockerEnvironment]
 
     @classmethod
@@ -92,11 +88,6 @@ class RenderingTask(CoreTask):
 
         self.test_task_res_path = None
 
-        self.verificator.res_x = self.res_x
-        self.verificator.res_y = self.res_y
-        self.verificator.total_tasks = self.total_tasks
-        self.verificator.root_path = self.root_path
-
     @CoreTask.handle_key_error
     def computation_failed(self, subtask_id):
         super().computation_failed(subtask_id)
@@ -129,26 +120,25 @@ class RenderingTask(CoreTask):
         """
         pass
 
-    def get_subtasks(self, part):
-        pass
-
     def get_preview_file_path(self):
         return self.preview_file_path
 
+    @handle_image_error(logger)
     def _update_preview(self, new_chunk_file_path, num_start):
-        img = load_as_pil(new_chunk_file_path)
-
-        img_current = self._open_preview()
-        img_current = ImageChops.add(img_current, img)
-        img_current.save(self.preview_file_path, PREVIEW_EXT)
-        img.close()
+        with handle_none(load_as_pil(new_chunk_file_path),
+                         raise_if_none=IOError("load_as_pil failed")) as img, \
+                self._open_preview() as img_current, \
+                ImageChops.add(img_current, img) as img_added:
+            img_added.save(self.preview_file_path, PREVIEW_EXT)
 
     @CoreTask.handle_key_error
     def _remove_from_preview(self, subtask_id):
+        subtask = self.subtasks_given[subtask_id]
         empty_color = (0, 0, 0)
-        img = self._open_preview()
-        self._mark_task_area(self.subtasks_given[subtask_id], img, empty_color)
-        img.save(self.preview_file_path, PREVIEW_EXT)
+        with handle_image_error(logger), \
+                self._open_preview() as img:
+            self._mark_task_area(subtask, img, empty_color)
+            img.save(self.preview_file_path, PREVIEW_EXT)
 
     def _update_task_preview(self):
         sent_color = (0, 255, 0)
@@ -158,16 +148,18 @@ class RenderingTask(CoreTask):
         preview_task_file_path = "{}".format(os.path.join(self.tmp_dir,
                                                           preview_name))
 
-        img_task = self._open_preview()
+        with handle_image_error(logger), \
+                self._open_preview() as img_task:
 
-        for sub in self.subtasks_given.values():
-            if SubtaskStatus.is_computed(sub['status']):
-                self._mark_task_area(sub, img_task, sent_color)
-            if sub['status'] in [SubtaskStatus.failure,
-                                 SubtaskStatus.restarted]:
-                self._mark_task_area(sub, img_task, failed_color)
+            for sub in self.subtasks_given.values():
+                if SubtaskStatus.is_active(sub['status']):
+                    self._mark_task_area(sub, img_task, sent_color)
+                if sub['status'] in [SubtaskStatus.failure,
+                                     SubtaskStatus.restarted]:
+                    self._mark_task_area(sub, img_task, failed_color)
 
-        img_task.save(preview_task_file_path, PREVIEW_EXT)
+            img_task.save(preview_task_file_path, PREVIEW_EXT)
+
         self._update_preview_task_file_path(preview_task_file_path)
 
     def _update_preview_task_file_path(self, preview_task_file_path):
@@ -245,11 +237,14 @@ class RenderingTask(CoreTask):
             preview_name = "current_preview.{}".format(ext)
             self.preview_file_path = "{}".format(os.path.join(self.tmp_dir,
                                                               preview_name))
-            img = Image.new(mode, (int(round(self.res_x * self.scale_factor)),
-                                   int(round(self.res_y * self.scale_factor))))
-            logger.debug('Saving new preview: %r', self.preview_file_path)
-            img.save(self.preview_file_path, ext)
-            img.close()
+
+            with handle_image_error(logger), \
+                    Image.new(mode,
+                              (int(round(self.res_x * self.scale_factor)),
+                               int(round(self.res_y * self.scale_factor)))) \
+                    as img:
+                logger.debug('Saving new preview: %r', self.preview_file_path)
+                img.save(self.preview_file_path, ext)
 
         return Image.open(self.preview_file_path)
 
@@ -285,10 +280,6 @@ class RenderingTaskBuilder(CoreTaskBuilder):
                            .format(total, defaults.default_subtasks))
             return defaults.default_subtasks
 
-    def _set_verification_options(self, new_task):
-        new_task.verificator.set_verification_options(
-            self.task_definition.verification_options)
-
     @staticmethod
     def _scene_file(type, resources):
         extensions = type.output_file_ext
@@ -307,7 +298,6 @@ class RenderingTaskBuilder(CoreTaskBuilder):
 
     def build(self):
         task = super(RenderingTaskBuilder, self).build()
-        self._set_verification_options(task)
         return task
 
     @classmethod
@@ -336,6 +326,16 @@ class RenderingTaskBuilder(CoreTaskBuilder):
         definition = parent.build_full_definition(task_type, dictionary)
         definition.output_format = options['format'].upper()
         definition.resolution = [int(val) for val in options['resolution']]
+        if definition.full_task_timeout < MIN_TIMEOUT:
+            logger.warning("Timeout %d too short for this task. "
+                           "Changing to %d" % (definition.full_task_timeout,
+                                               MIN_TIMEOUT))
+            definition.full_task_timeout = MIN_TIMEOUT
+        if definition.subtask_timeout < SUBTASK_MIN_TIMEOUT:
+            logger.warning("Subtask timeout %d too short for this task. "
+                           "Changing to %d" % (definition.subtask_timeout,
+                                               SUBTASK_MIN_TIMEOUT))
+            definition.subtask_timeout = SUBTASK_MIN_TIMEOUT
         return definition
 
     @classmethod
@@ -343,6 +343,4 @@ class RenderingTaskBuilder(CoreTaskBuilder):
         parent = super(RenderingTaskBuilder, cls)
         path = parent.get_output_path(dictionary, definition)
 
-        if definition.legacy:
-            return path
         return '{}.{}'.format(path, dictionary['options']['format'])

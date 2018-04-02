@@ -1,69 +1,76 @@
-import atexit
 import logging
 import sys
 import time
 import uuid
+import json
 from collections import Iterable
-from copy import copy
+from copy import copy, deepcopy
 from os import path, makedirs
+from pathlib import Path
 from threading import Lock, Thread
-from typing import Dict
+from typing import Dict, Hashable, Optional, Union, List
 
 from pydispatch import dispatcher
-from twisted.internet import task
-from twisted.internet.defer import (inlineCallbacks, returnValue, gatherResults,
-                                    Deferred)
+from twisted.internet.defer import (
+    inlineCallbacks,
+    returnValue,
+    gatherResults,
+    Deferred)
 
-from golem.appconfig import (AppConfig, PUBLISH_BALANCE_INTERVAL,
-                             PUBLISH_TASKS_INTERVAL)
-from golem.clientconfigdescriptor import ClientConfigDescriptor, ConfigApprover
+import golem
+from golem.appconfig import (TASKARCHIVE_MAINTENANCE_INTERVAL,
+                             PAYMENT_CHECK_INTERVAL, AppConfig)
+from golem.clientconfigdescriptor import ConfigApprover, ClientConfigDescriptor
 from golem.config.presets import HardwarePresetsMixin
 from golem.core.async import AsyncRequest, async_run
-from golem.core.common import to_unicode
+from golem.core.common import get_timestamp_utc, to_unicode, string_to_timeout
 from golem.core.fileshelper import du
 from golem.core.hardware import HardwarePresets
-from golem.core.keysauth import EllipticalKeysAuth
-from golem.core.simpleenv import get_local_datadir
+from golem.core.keysauth import KeysAuth
+from golem.core.service import LoopingCallService
 from golem.core.simpleserializer import DictSerializer
 from golem.core.threads import callback_wrapper
-from golem.core.variables import APP_VERSION
+from golem.database import Database
 from golem.diag.service import DiagnosticsService, DiagnosticsOutputFormat
 from golem.diag.vm import VMDiagnosticsProvider
 from golem.environments.environment import Environment as DefaultEnvironment
 from golem.environments.environmentsmanager import EnvironmentsManager
-from golem.manager.nodestatesnapshot import NodeStateSnapshot
-from golem.model import Database, Account
 from golem.monitor.model.nodemetadatamodel import NodeMetadataModel
 from golem.monitor.monitor import SystemMonitor
 from golem.monitorconfig import MONITOR_CONFIG
+from golem.network.concent.client import ConcentClientService
+from golem.network.concent.filetransfers import ConcentFiletransferService
+from golem.network.history import MessageHistoryService
 from golem.network.hyperdrive.daemon_manager import HyperdriveDaemonManager
 from golem.network.p2p.node import Node
 from golem.network.p2p.p2pservice import P2PService
 from golem.network.p2p.peersession import PeerSessionInfo
 from golem.network.transport.tcpnetwork import SocketAddress
+from golem.network.upnp.mapper import PortMapperManager
 from golem.ranking.helper.trust import Trust
 from golem.ranking.ranking import Ranking
 from golem.report import Component, Stage, StatusPublisher, report_calls
 from golem.resource.base.resourceserver import BaseResourceServer
 from golem.resource.dirmanager import DirManager, DirectoryType
-# noqa
 from golem.resource.hyperdrive.resourcesmanager import HyperdriveResourceManager
-from golem.rpc.mapping.aliases import Task, Network, Environment, UI, Payments
-from golem.rpc.session import Publisher
+from golem.resource.resource import get_resources_for_task, ResourceType
+from golem.rpc.mapping.rpceventnames import Task, Network, Environment, UI
 from golem.task import taskpreset
-from golem.task.taskbase import ResourceType
+from golem.task.taskarchiver import TaskArchiver
 from golem.task.taskserver import TaskServer
 from golem.task.taskstate import TaskTestStatus
 from golem.task.tasktester import TaskTester
 from golem.tools import filelock
 from golem.transactions.ethereum.ethereumtransactionsystem import \
     EthereumTransactionSystem
-from golem.utils import encode_hex
+from golem.transactions.ethereum.fundslocker import FundsLocker
+from golem.tools.talkback import enable_sentry_logger
 
-log = logging.getLogger("golem.client")
+logger = logging.getLogger(__name__)
 
 
 class ClientTaskComputerEventListener(object):
+
     def __init__(self, client):
         self.client = client
 
@@ -75,108 +82,120 @@ class ClientTaskComputerEventListener(object):
 
 
 class Client(HardwarePresetsMixin):
-    def __init__(
+    _services = []  # type: List[IService]
+
+    def __init__(  # noqa pylint: disable=too-many-arguments
             self,
-            datadir=None,
-            transaction_system=False,
-            connect_to_known_hosts=True,
-            use_docker_machine_manager=True,
-            use_monitor=True,
-            geth_port=None,
-            **config_overrides):
+            datadir: str,
+            app_config: AppConfig,
+            config_desc: ClientConfigDescriptor,
+            keys_auth: KeysAuth,
+            database: Database,
+            mainnet: bool = False,
+            connect_to_known_hosts: bool = True,
+            use_docker_manager: bool = True,
+            use_monitor: bool = True,
+            use_concent: bool = False,
+            start_geth: bool = False,
+            start_geth_port: Optional[int] = None,
+            geth_address: Optional[str] = None) -> None:
 
-        if not datadir:
-            datadir = get_local_datadir('default')
-
+        self.mainnet = mainnet
         self.datadir = datadir
         self.__lock_datadir()
         self.lock = Lock()
         self.task_tester = None
 
+        self.task_archiver = TaskArchiver(datadir)
+
         # Read and validate configuration
-        config = AppConfig.load_config(datadir)
-        self.config_desc = ClientConfigDescriptor()
-        self.config_desc.init_from_app_config(config)
-
-        for key, val in list(config_overrides.items()):
-            if not hasattr(self.config_desc, key):
-                self.quit()  # quit only closes underlying services (for now)
-                raise AttributeError(
-                    "Can't override nonexistent config entry '{}'".format(key))
-            setattr(self.config_desc, key, val)
-
+        self.app_config = app_config
+        self.config_desc = config_desc
         self.config_approver = ConfigApprover(self.config_desc)
 
-        log.info(
+        logger.info(
             'Client "%s", datadir: %s',
             self.config_desc.node_name,
             datadir
         )
-
-        # Initialize database
-        self.db = Database(datadir)
+        self.db = database
 
         # Hardware configuration
         HardwarePresets.initialize(self.datadir)
         HardwarePresets.update_config(self.config_desc.hardware_preset_name,
                                       self.config_desc)
 
-        self.keys_auth = EllipticalKeysAuth(self.datadir)
+        self.keys_auth = keys_auth
 
         # NETWORK
         self.node = Node(node_name=self.config_desc.node_name,
                          prv_addr=self.config_desc.node_address,
-                         key=self.keys_auth.get_key_id())
+                         key=self.keys_auth.key_id)
 
         self.p2pservice = None
         self.diag_service = None
+        self.use_concent = use_concent
+        self.concent_service = ConcentClientService(
+            enabled=self.use_concent,
+            keys_auth=self.keys_auth,
+        )
+        self.concent_filetransfers = ConcentFiletransferService(
+            keys_auth=self.keys_auth,
+        )
 
         self.task_server = None
-        self.last_nss_time = time.time()
-        self.last_net_check_time = time.time()
-        self.last_balance_time = time.time()
-        self.last_tasks_time = time.time()
-
-        self.last_node_state_snapshot = None
+        self.port_mapper = None
 
         self.nodes_manager_client = None
 
-        self.do_work_task = task.LoopingCall(self.__do_work)
-        self.publish_task = task.LoopingCall(self.__publish_events)
+        self._services = [
+            NetworkConnectionPublisherService(
+                self,
+                int(self.config_desc.network_check_interval)),
+            TaskArchiverService(self.task_archiver),
+            MessageHistoryService(),
+            DoWorkService(self),
+        ]
 
-        self.cfg = config
-        self.send_snapshot = False
-        self.snapshot_lock = Lock()
+        clean_resources_older_than = \
+            self.config_desc.clean_resources_older_than_seconds
+        if clean_resources_older_than > 0:
+            self._services.append(
+                ResourceCleanerService(
+                    self,
+                    interval_seconds=max(
+                        1, int(clean_resources_older_than / 10)),
+                    older_than_seconds=clean_resources_older_than))
 
         self.ranking = Ranking(self)
 
-        if transaction_system:
-            # Bootstrap transaction system if enabled.
-            # TODO: Transaction system (and possible other modules) should be
-            #       modeled as a Service that run independently.
-            #       The Client/Application should be a collection of services.
-            self.transaction_system = EthereumTransactionSystem(
-                datadir,
-                self.keys_auth._private_key,
-                geth_port)
-        else:
-            self.transaction_system = None
+        self.transaction_system = EthereumTransactionSystem(
+            datadir,
+            self.keys_auth._private_key,
+            mainnet,
+            start_geth=start_geth,
+            start_port=start_geth_port,
+            address=geth_address,
+        )
 
-        self.use_docker_machine_manager = use_docker_machine_manager
+        self.funds_locker = FundsLocker(self.transaction_system,
+                                        Path(self.datadir))
+        self._services.append(self.funds_locker)
+
+        self.use_docker_manager = use_docker_manager
         self.connect_to_known_hosts = connect_to_known_hosts
         self.environments_manager = EnvironmentsManager()
         self.daemon_manager = None
 
         self.rpc_publisher = None
+        self.task_test_result = None
 
-        self.ipfs_manager = None
         self.resource_server = None
         self.resource_port = 0
-        self.last_get_resource_peers_time = time.time()
-        self.get_resource_peers_interval = 5.0
         self.use_monitor = use_monitor
         self.monitor = None
         self.session_id = str(uuid.uuid4())
+        self.mainnet = mainnet
 
         dispatcher.connect(
             self.p2p_listener,
@@ -187,100 +206,177 @@ class Client(HardwarePresetsMixin):
             signal='golem.taskmanager'
         )
 
-        atexit.register(self.quit)
+        logger.debug('Client init completed')
 
-    def configure_rpc(self, rpc_session):
-        self.rpc_publisher = Publisher(rpc_session)
-        StatusPublisher.set_publisher(self.rpc_publisher)
+    def set_rpc_publisher(self, rpc_publisher):
+        self.rpc_publisher = rpc_publisher
 
-    def p2p_listener(self, sender, signal, event='default', **kwargs):
-        if event != 'unreachable':
-            return
-        self.node.port_status = kwargs.get('description', '')
+    def p2p_listener(self, event='default', **kwargs):
+        if event == 'unreachable':
+            self.on_unreachable(**kwargs)
+        elif event == 'unsynchronized':
+            self.on_unsynchronized(**kwargs)
+        elif event == 'new_version':
+            self.on_new_version(**kwargs)
+
+    def on_unreachable(self, port, description, **_):
+        logger.warning('Port %d unreachable: %s', port, description)
+        self.node.port_statuses[port] = description
+
+    @staticmethod
+    def on_unsynchronized(time_diff, **_):
+        logger.warning(
+            'Node time unsynchronized with monitor. Time diff: %f (s)',
+            time_diff)
+
+    def on_new_version(self, version, **_):
+        logger.warning('New version of golem available: %s', version)
+        self._publish(Network.new_version, str(version))
 
     def taskmanager_listener(self, sender, signal, event='default', **kwargs):
         if event != 'task_status_updated':
             return
+        logger.debug(
+            'taskmanager_listen (sender: %r, signal: %r, event: %r, args: %r)',
+            sender, signal, event, kwargs
+        )
         self._publish(Task.evt_task_status, kwargs['task_id'])
 
-    # TODO: re-enable
+    # TODO: re-enable. issue #2398
     def sync(self):
         pass
 
     @report_calls(Component.client, 'start', stage=Stage.pre)
     def start(self):
+
+        logger.debug('Starting client services ...')
+        self.environments_manager.load_config(self.datadir)
+        self.concent_service.start()
+        self.concent_filetransfers.start()
+
         if self.use_monitor and not self.monitor:
             self.init_monitor()
         try:
             self.start_network()
         except Exception:
-            log.critical('Can\'t start network. Giving up.', exc_info=True)
+            logger.critical('Can\'t start network. Giving up.', exc_info=True)
             sys.exit(1)
 
-        self.do_work_task.start(1, False)
-        self.publish_task.start(1, True)
+        for service in self._services:
+            if not service.running:
+                service.start()
+        logger.debug('Started client services')
 
     @report_calls(Component.client, 'stop', stage=Stage.post)
     def stop(self):
+        logger.debug('Stopping client services ...')
         self.stop_network()
-        if self.do_work_task.running:
-            self.do_work_task.stop()
-        if self.publish_task.running:
-            self.publish_task.stop()
+
+        for service in self._services:
+            if service.running:
+                service.stop()
+        self.concent_service.stop()
+        if self.concent_filetransfers.running:
+            self.concent_filetransfers.stop()
         if self.task_server:
             self.task_server.task_computer.quit()
         if self.use_monitor and self.monitor:
             self.stop_monitor()
             self.monitor = None
+        logger.debug('Stopped client services')
 
     def start_network(self):
-        log.info("Starting network ...")
+        logger.info("Starting network ...")
         self.node.collect_network_info(self.config_desc.seed_host,
                                        use_ipv6=self.config_desc.use_ipv6)
-        log.debug("Is super node? %s", self.node.is_super_node())
 
-        if not self.p2pservice:
-            self.p2pservice = P2PService(
-                self.node,
-                self.config_desc,
-                self.keys_auth,
-                connect_to_known_hosts=self.connect_to_known_hosts
-            )
+        logger.debug("Is super node? %s", self.node.is_super_node())
 
-        if not self.task_server:
-            self.task_server = TaskServer(
-                self.node,
-                self.config_desc,
-                self.keys_auth, self,
-                use_ipv6=self.config_desc.use_ipv6,
-                use_docker_machine_manager=self.use_docker_machine_manager)
+        self.p2pservice = P2PService(
+            self.node,
+            self.config_desc,
+            self.keys_auth,
+            self.mainnet,
+            connect_to_known_hosts=self.connect_to_known_hosts
+        )
+
+        self.task_server = TaskServer(
+            self.node,
+            self.config_desc,
+            self,
+            use_ipv6=self.config_desc.use_ipv6,
+            use_docker_manager=self.use_docker_manager,
+            task_archiver=self.task_archiver)
+
+        monitoring_publisher_service = MonitoringPublisherService(
+            self.task_server,
+            interval_seconds=max(
+                int(self.config_desc.node_snapshot_interval),
+                1))
+        monitoring_publisher_service.start()
+        self._services.append(monitoring_publisher_service)
 
         dir_manager = self.task_server.task_computer.dir_manager
 
-        log.info("Starting resource server ...")
+        logger.info("Starting resource server ...")
 
-        if not self.daemon_manager:
-            self.daemon_manager = HyperdriveDaemonManager(self.datadir)
-            self.daemon_manager.start()
+        self.daemon_manager = HyperdriveDaemonManager(self.datadir)
+        self.daemon_manager.start()
 
         hyperdrive_addrs = self.daemon_manager.public_addresses(
             self.node.pub_addr)
         hyperdrive_ports = self.daemon_manager.ports()
 
-        if not self.resource_server:
-            resource_manager = HyperdriveResourceManager(dir_manager,
-                                                         hyperdrive_addrs)
-            self.resource_server = BaseResourceServer(resource_manager,
-                                                      dir_manager,
-                                                      self.keys_auth, self)
+        self.node.hyperdrive_prv_port = next(iter(hyperdrive_ports))
+
+        clean_tasks_older_than = \
+            self.config_desc.clean_tasks_older_than_seconds
+        if clean_tasks_older_than > 0:
+            self.clean_old_tasks()
+
+        resource_manager = HyperdriveResourceManager(
+            dir_manager=dir_manager,
+            daemon_address=hyperdrive_addrs
+        )
+        self.resource_server = BaseResourceServer(
+            resource_manager=resource_manager,
+            dir_manager=dir_manager,
+            keys_auth=self.keys_auth,
+            client=self
+        )
+        self.task_server.restore_resources()
+
+        # Start service after restore_resources() to avoid race conditions
+        if clean_tasks_older_than:
+            task_cleaner_service = TaskCleanerService(
+                client=self,
+                interval_seconds=max(1, clean_tasks_older_than // 10)
+            )
+            task_cleaner_service.start()
+            self._services.append(task_cleaner_service)
 
         def connect(ports):
-            p2p_port, task_port = ports
-            log.info('P2P server is listening on port %s', p2p_port)
-            log.info('Task server is listening on port %s', task_port)
+            logger.info(
+                'Golem is listening on ports: P2P=%s, Task=%s, Hyperdrive=%r',
+                self.node.p2p_prv_port,
+                self.node.prv_port,
+                self.node.hyperdrive_prv_port
+            )
 
-            dispatcher.send(signal='golem.p2p', event='listening',
-                            port=[p2p_port, task_port] + list(hyperdrive_ports))
+            if self.config_desc.use_upnp:
+                self.start_upnp(ports + list(hyperdrive_ports))
+            self.node.update_public_info()
+
+            public_ports = [
+                self.node.p2p_pub_port,
+                self.node.pub_port,
+                self.node.hyperdrive_pub_port
+            ]
+
+            dispatcher.send(
+                signal='golem.p2p',
+                event='listening',
+                ports=public_ports)
 
             listener = ClientTaskComputerEventListener(self)
             self.task_server.task_computer.register_listener(listener)
@@ -295,7 +391,7 @@ class Client(HardwarePresetsMixin):
                                     stage=Stage.post)
 
         def terminate(*exceptions):
-            log.error("Golem cannot listen on ports: %s", exceptions)
+            logger.error("Golem cannot listen on ports: %s", exceptions)
             StatusPublisher.publish(Component.client, 'start',
                                     stage=Stage.exception,
                                     data=[to_unicode(e) for e in exceptions])
@@ -306,66 +402,83 @@ class Client(HardwarePresetsMixin):
 
         gatherResults([p2p, task], consumeErrors=True).addCallbacks(connect,
                                                                     terminate)
-        log.info("Starting p2p server ...")
-        resource_manager = self.resource_server.resource_manager
+        logger.info("Starting p2p server ...")
         self.p2pservice.task_server = self.task_server
         self.p2pservice.set_resource_server(self.resource_server)
-        self.p2pservice.set_metadata_manager(resource_manager.peer_manager)
         self.p2pservice.start_accepting(listening_established=p2p.callback,
                                         listening_failure=p2p.errback)
 
-        log.info("Starting task server ...")
+        logger.info("Starting task server ...")
         self.task_server.start_accepting(listening_established=task.callback,
                                          listening_failure=task.errback)
 
+    def start_upnp(self, ports):
+        logger.debug("Starting upnp ...")
+        self.port_mapper = PortMapperManager()
+        self.port_mapper.discover()
+
+        if self.port_mapper.available:
+            for port in ports:
+                self.port_mapper.create_mapping(port)
+            self.port_mapper.update_node(self.node)
+
     def stop_network(self):
+        logger.info("Stopping network ...")
         if self.p2pservice:
             self.p2pservice.stop_accepting()
             self.p2pservice.disconnect()
         if self.task_server:
             self.task_server.stop_accepting()
             self.task_server.disconnect()
+        if self.port_mapper:
+            self.port_mapper.quit()
 
+    @inlineCallbacks
     def pause(self):
-        if self.do_work_task.running:
-            self.do_work_task.stop()
-        if self.publish_task.running:
-            self.publish_task.stop()
+        logger.info("Pausing ...")
+        for service in self._services:
+            if service.running:
+                service.stop()
 
         if self.p2pservice:
             self.p2pservice.pause()
             self.p2pservice.disconnect()
         if self.task_server:
-            self.task_server.pause()
+            yield self.task_server.pause()
             self.task_server.disconnect()
             self.task_server.task_computer.quit()
+        logger.info("Paused")
 
     def resume(self):
-        if not self.do_work_task.running:
-            self.do_work_task.start(1, False)
-        if not self.publish_task.running:
-            self.publish_task.start(1, True)
+        logger.info("Resuming ...")
+        for service in self._services:
+            if not service.running:
+                service.start()
 
         if self.p2pservice:
             self.p2pservice.resume()
             self.p2pservice.connect_to_network()
         if self.task_server:
             self.task_server.resume()
+        logger.info("Resumed")
 
     def init_monitor(self):
+        logger.debug("Starting monitor ...")
         metadata = self.__get_nodemetadatamodel()
-        self.monitor = SystemMonitor(metadata, MONITOR_CONFIG)
+        self.monitor = SystemMonitor(
+            metadata, MONITOR_CONFIG, send_payment_info=(not self.mainnet))
         self.monitor.start()
         self.diag_service = DiagnosticsService(DiagnosticsOutputFormat.data)
         self.diag_service.register(
             VMDiagnosticsProvider(),
             self.monitor.on_vm_snapshot
         )
-        self.diag_service.start_looping_call()
+        self.diag_service.start()
 
     def stop_monitor(self):
+        logger.debug("Stopping monitor ...")
         self.monitor.shut_down()
-        self.diag_service.stop_looping_call()
+        self.diag_service.stop()
 
     def connect(self, socket_address):
         if isinstance(socket_address, Iterable):
@@ -374,7 +487,7 @@ class Client(HardwarePresetsMixin):
                 int(socket_address[1])
             )
 
-        log.debug(
+        logger.debug(
             "P2pservice connecting to %s on port %s",
             socket_address.address,
             socket_address.port
@@ -383,10 +496,10 @@ class Client(HardwarePresetsMixin):
 
     @report_calls(Component.client, 'quit', once=True)
     def quit(self):
+        logger.info('Shutting down ...')
         self.stop()
 
-        if self.transaction_system:
-            self.transaction_system.stop()
+        self.transaction_system.stop()
         if self.diag_service:
             self.diag_service.unregister_all()
         if self.daemon_manager:
@@ -398,36 +511,57 @@ class Client(HardwarePresetsMixin):
             self.db.close()
         self._unlock_datadir()
 
-    def key_changed(self):
-        self.node.key = self.keys_auth.get_key_id()
-        self.task_server.key_changed()
-        self.p2pservice.key_changed()
-
     def enqueue_new_task(self, task_dict):
-        # FIXME: Statement only for old DummyTask compatibility
+        task_manager = self.task_server.task_manager
+        _result = Deferred()
+
+        # FIXME: Statement only for old DummyTask compatibility #2467
         if isinstance(task_dict, dict):
-            task = self.task_server.task_manager.create_task(task_dict)
+            logger.warning('enqueue_new_task called with deprecated dict type')
+            task = task_manager.create_task(task_dict)
         else:
             task = task_dict
 
-        resource_manager = self.resource_server.resource_manager
-        task_manager = self.task_server.task_manager
-        task_manager.add_new_task(task)
+        if self.transaction_system:
+            self.funds_locker.lock_funds(task)
 
         task_id = task.header.task_id
-        options = resource_manager.build_client_options()
-        files = task.get_resources(None, ResourceType.HASHES)
+        logger.info('Enqueue new task "%r"', task_id)
+        files = get_resources_for_task(resource_header=None,
+                                       resource_type=ResourceType.HASHES,
+                                       tmp_dir=getattr(task, 'tmp_dir', None),
+                                       resources=task.get_resources())
 
-        def add_task(_):
-            request = AsyncRequest(task_manager.start_task, task_id)
-            async_run(request, None, error)
+        def package_created(packager_result):
+            package_path, package_sha1 = packager_result
+            task.header.resource_size = path.getsize(package_path)
+            task_manager.add_new_task(task)
 
-        def error(e):
-            log.error("Task %s creation failed: %s", task_id, e)
+            _resources = self.resource_server.add_task(package_path,
+                                                       package_sha1,
+                                                       task_id)
+            _resources.addCallbacks(task_created, error)
 
-        deferred = self.resource_server.add_task(files, task_id, options)
-        deferred.addCallbacks(add_task, error)
-        return task
+        def task_created(resource_server_result):
+            resource_manager_result, package_hash = resource_server_result
+
+            try:
+                task_state = task_manager.tasks_states[task_id]
+                task_state.package_hash = package_hash
+                task_state.resource_hash = resource_manager_result[0]
+            except Exception as exc:  # pylint: disable=broad-except
+                error(exc)
+            else:
+                request = AsyncRequest(task_manager.start_task, task_id)
+                async_run(request, lambda _: _result.callback(task), error)
+
+        def error(exception):
+            logger.error("Task '%s' creation failed: %r", task_id, exception)
+            _result.errback(exception)
+
+        _package = self.resource_server.create_resource_package(files, task_id)
+        _package.addCallbacks(package_created, error)
+        return _result
 
     def task_resource_send(self, task_id):
         self.task_server.task_manager.resources_send(task_id)
@@ -441,38 +575,38 @@ class Client(HardwarePresetsMixin):
     def task_resource_failure(self, task_id, reason):
         self.task_server.task_computer.task_resource_failure(task_id, reason)
 
-    def set_resource_port(self, resource_port):
-        self.resource_port = resource_port
-        self.p2pservice.set_resource_peer(
-            self.node.prv_addr,
-            self.resource_port
-        )
-
     def run_test_task(self, t_dict):
+        logger.info('Running test task "%r" ...', t_dict)
         if self.task_tester is None:
             request = AsyncRequest(self._run_test_task, t_dict)
             async_run(request)
             return True
 
-        if self.rpc_publisher:
-            self.rpc_publisher.publish(
-                Task.evt_task_test_status,
-                TaskTestStatus.error,
-                "Another test is running"
-            )
+        if not self.task_test_result:
+            self.task_test_result = json.dumps(
+                {
+                    "status": TaskTestStatus.error,
+                    "error": "Another test is running"
+                })
         return False
 
     def _run_test_task(self, t_dict):
 
         def on_success(*args, **kwargs):
+            logger.info('Test task succes "%r"', t_dict)
             self.task_tester = None
-            self._publish(Task.evt_task_test_status,
-                          TaskTestStatus.success, *args, **kwargs)
+            self.task_test_result = json.dumps(
+                {
+                    "status": TaskTestStatus.success,
+                    "error": args,
+                    "more": kwargs
+                })
 
         def on_error(*args, **kwargs):
+            logger.warning('Test task error "%r": %r', t_dict, args)
             self.task_tester = None
-            self._publish(Task.evt_task_test_status,
-                          TaskTestStatus.error, *args, **kwargs)
+            self.task_test_result = json.dumps(
+                {"status": TaskTestStatus.error, "error": args, "more": kwargs})
 
         try:
             dictionary = DictSerializer.load(t_dict)
@@ -484,27 +618,61 @@ class Client(HardwarePresetsMixin):
 
         self.task_tester = TaskTester(task, self.datadir, on_success, on_error)
         self.task_tester.run()
-        self._publish(Task.evt_task_test_status, TaskTestStatus.started, True)
+        self.task_test_result = json.dumps(
+            {"status": TaskTestStatus.started, "error": True})
 
     def abort_test_task(self):
+        logger.debug('Aborting test task ...')
         with self.lock:
             if self.task_tester is not None:
                 self.task_tester.end_comp()
                 return True
             return False
 
+    def check_test_status(self):
+        logger.debug('Checking test task status ...')
+        if self.task_test_result is None:
+            return False
+        if not json.loads(
+                self.task_test_result)['status'] == TaskTestStatus.started:
+            result = copy(self.task_test_result)
+            # when client receive the eventual result we'll clean result for
+            # the next one.
+            self.task_test_result = None
+            return result
+        return self.task_test_result
+
     def create_task(self, t_dict):
         try:
-            task = self.enqueue_new_task(t_dict)
-            return str(task.header.task_id)
-        except Exception:
-            log.exception("Cannot create task {}".format(t_dict))
+            self.enqueue_new_task(t_dict)
+            return True, ''
+        except Exception as ex:
+            logger.exception("Cannot create task %r", t_dict)
+            return False, str(ex)
 
     def abort_task(self, task_id):
+        logger.debug('Aborting task "%r" ...', task_id)
         self.task_server.task_manager.abort_task(task_id)
 
     def restart_task(self, task_id):
-        self.task_server.task_manager.restart_task(task_id)
+        logger.debug('Restarting task "%r" ...', task_id)
+        task_manager = self.task_server.task_manager
+
+        # Task state is changed to restarted and stays this way until it's
+        # deleted from task manager.
+        try:
+            task_manager.put_task_in_restarted_state(task_id)
+        except task_manager.AlreadyRestartedError:
+            return None
+
+        # Create new task that is a copy of the definition of the old one.
+        # It has a new deadline and a new task id.
+        task_dict = deepcopy(
+            task_manager.get_task_definition_dict(
+                task_manager.tasks[task_id]))
+        del task_dict['id']
+
+        return self.create_task(task_dict)
 
     def restart_frame_subtasks(self, task_id, frame):
         self.task_server.task_manager.restart_frame_subtasks(task_id, frame)
@@ -513,9 +681,11 @@ class Client(HardwarePresetsMixin):
         self.task_server.task_manager.restart_subtask(subtask_id)
 
     def delete_task(self, task_id):
+        logger.debug('Deleting task "%r" ...', task_id)
         self.remove_task_header(task_id)
         self.remove_task(task_id)
         self.task_server.task_manager.delete_task(task_id)
+        self.funds_locker.remove_task(task_id)
 
     def get_node(self):
         return self.node.to_dict()
@@ -533,11 +703,10 @@ class Client(HardwarePresetsMixin):
     def get_suggested_conn_reverse(self, key_id):
         return self.p2pservice.get_suggested_conn_reverse(key_id)
 
-    def get_resource_peers(self):
-        self.p2pservice.send_get_resource_peers()
-
     def get_peers(self):
-        return list(self.p2pservice.peers.values())
+        if self.p2pservice:
+            return list(self.p2pservice.peers.values())
+        return list()
 
     def get_known_peers(self):
         peers = self.p2pservice.incoming_peers or dict()
@@ -559,23 +728,11 @@ class Client(HardwarePresetsMixin):
         if self.task_server:
             return self.task_server.task_computer.dir_manager
 
-    def load_keys_from_file(self, file_name):
-        if file_name != "":
-            return self.keys_auth.load_from_file(file_name)
-        return False
-
-    def save_keys_to_files(self, private_key_path, public_key_path):
-        return self.keys_auth.save_to_files(private_key_path, public_key_path)
-
     def get_key_id(self):
-        return self.get_client_id()
+        return self.keys_auth.key_id
 
     def get_difficulty(self):
         return self.keys_auth.get_difficulty()
-
-    def get_client_id(self):
-        key_id = self.keys_auth.get_key_id()
-        return str(key_id) if key_id else None
 
     def get_node_key(self):
         key = self.node.key
@@ -589,7 +746,7 @@ class Client(HardwarePresetsMixin):
             raise KeyError("Unknown setting: {}".format(key))
 
         value = getattr(self.config_desc, key)
-        if key in ConfigApprover.numeric_opt:
+        if ConfigApprover.is_numeric(key):
             return str(value)
         return value
 
@@ -616,15 +773,19 @@ class Client(HardwarePresetsMixin):
         return self.task_server.cur_port
 
     def get_task_count(self):
-        return len(self.task_server.task_keeper.get_all_tasks())
+        if self.task_server:
+            return len(self.task_server.task_keeper.get_all_tasks())
+        return 0
 
     def get_task(self, task_id):
         return self.task_server.task_manager.get_task_dict(task_id)
 
     def get_tasks(self, task_id=None):
-        if task_id:
-            return self.task_server.task_manager.get_task_dict(task_id)
-        return self.task_server.task_manager.get_tasks_dict()
+        if self.task_server:
+            if task_id:
+                return self.task_server.task_manager.get_task_dict(task_id)
+            return self.task_server.task_manager.get_tasks_dict()
+        return []
 
     def get_subtasks(self, task_id):
         return self.task_server.task_manager.get_subtasks_dict(task_id)
@@ -653,41 +814,78 @@ class Client(HardwarePresetsMixin):
         }
 
     def get_supported_task_count(self) -> int:
-        return len(self.task_server.task_keeper.supported_tasks)
+        if self.task_server:
+            return len(self.task_server.task_keeper.supported_tasks)
+        return 0
 
     def get_computed_task_count(self):
-        return self.task_server.task_computer.stats.get_stats('computed_tasks')
+        return self.get_task_computer_stat('computed_tasks')
 
     def get_timeout_task_count(self):
-        return self.task_server\
-            .task_computer.stats.get_stats('tasks_with_timeout')
+        return self.get_task_computer_stat('tasks_with_timeout')
 
     def get_error_task_count(self):
-        return self.task_server\
-            .task_computer.stats.get_stats('tasks_with_errors')
+        return self.get_task_computer_stat('tasks_with_errors')
+
+    def get_unsupport_reasons(self, last_days):
+        if last_days < 0:
+            raise ValueError("Incorrect number of days: {}".format(last_days))
+        if last_days > 0:
+            return self.task_archiver.get_unsupport_reasons(last_days)
+        else:
+            return self.task_server.task_keeper.get_unsupport_reasons()
 
     def get_payment_address(self):
         address = self.transaction_system.get_payment_address()
         return str(address) if address else None
 
+    def get_task_computer_stat(self, name):
+        if self.task_server and self.task_server.task_computer:
+            return self.task_server.task_computer.stats.get_stats(name)
+        return None, None
+
     @inlineCallbacks
     def get_balance(self):
-        if self.use_transaction_system():
-            req = AsyncRequest(self.transaction_system.get_balance)
-            b, ab, d = yield async_run(req)
-            if b is not None:
-                returnValue((str(b), str(ab), str(d)))
-        returnValue((None, None, None))
+        gnt, av_gnt, eth, \
+            last_gnt_update, \
+            last_eth_update = yield self.transaction_system.get_balance()
+        if gnt is not None:
+            return str(gnt), str(av_gnt), str(eth), str(
+                last_gnt_update), str(last_eth_update)
+        return None, None, None, None, None
 
     def get_payments_list(self):
-        if self.use_transaction_system():
-            return self.transaction_system.get_payments_list()
-        return ()
+        return self.transaction_system.get_payments_list()
 
     def get_incomes_list(self):
-        if self.use_transaction_system():
-            return self.transaction_system.get_incoming_payments()
-        return []
+        return self.transaction_system.get_incoming_payments()
+
+    def get_withdraw_gas_cost(
+            self,
+            amount: Union[str, int],
+            currency: str) -> int:
+        if isinstance(amount, str):
+            amount = int(amount)
+        return self.transaction_system.get_withdraw_gas_cost(amount, currency)
+
+    def withdraw(
+            self,
+            amount: Union[str, int],
+            destination: str,
+            currency: str) -> List[str]:
+        if not self.mainnet:
+            raise Exception("Withdrawals are disabled on testnet")
+
+        if isinstance(amount, str):
+            amount = int(amount)
+        gnt_lock, eth_lock = self.funds_locker.sum_locks()
+        if currency == 'GNT':
+            lock = gnt_lock
+        else:
+            lock = eth_lock
+
+        return self.transaction_system.withdraw(amount, destination, currency,
+                                                lock)
 
     def get_task_cost(self, task_id):
         """
@@ -699,9 +897,6 @@ class Client(HardwarePresetsMixin):
         if cost is None:
             return 0.0
         return cost
-
-    def use_transaction_system(self):
-        return bool(self.transaction_system)
 
     def get_computing_trust(self, node_id):
         if self.use_ranking():
@@ -719,29 +914,6 @@ class Client(HardwarePresetsMixin):
     def want_to_start_task_session(self, key_id, node_id, conn_id):
         self.p2pservice.want_to_start_task_session(key_id, node_id, conn_id)
 
-    def inform_about_task_nat_hole(
-            self,
-            key_id,
-            rv_key_id,
-            addr,
-            port,
-            ans_conn_id
-            ):
-        self.p2pservice.inform_about_task_nat_hole(
-            key_id,
-            rv_key_id,
-            addr,
-            port,
-            ans_conn_id
-        )
-
-    def inform_about_nat_traverse_failure(self, key_id, res_key_id, conn_id):
-        self.p2pservice.inform_about_nat_traverse_failure(
-            key_id,
-            res_key_id,
-            conn_id
-        )
-
     # CLIENT CONFIGURATION
     def set_rpc_server(self, rpc_server):
         self.rpc_server = rpc_server
@@ -749,14 +921,17 @@ class Client(HardwarePresetsMixin):
 
     def change_config(self, new_config_desc, run_benchmarks=False):
         self.config_desc = self.config_approver.change_config(new_config_desc)
-        self.cfg.change_config(self.config_desc)
-        self.p2pservice.change_config(self.config_desc)
         self.upsert_hw_preset(HardwarePresets.from_config(self.config_desc))
+
+        if self.p2pservice:
+            self.p2pservice.change_config(self.config_desc)
         if self.task_server:
-            self.task_server.change_config(
-                self.config_desc,
-                run_benchmarks=run_benchmarks
-            )
+            self.task_server.change_config(self.config_desc,
+                                           run_benchmarks=run_benchmarks)
+
+        self.enable_talkback(self.config_desc.enable_talkback)
+        self.app_config.change_config(self.config_desc)
+
         dispatcher.send(
             signal='golem.monitor',
             event='config_update',
@@ -765,13 +940,6 @@ class Client(HardwarePresetsMixin):
 
     def register_nodes_manager_client(self, nodes_manager_client):
         self.nodes_manager_client = nodes_manager_client
-
-    def change_timeouts(self, task_id, full_task_timeout, subtask_timeout):
-        self.task_server.change_timeouts(
-            task_id,
-            full_task_timeout,
-            subtask_timeout
-        )
 
     def query_task_state(self, task_id):
         state = self.task_server.task_manager.query_task_state(task_id)
@@ -821,32 +989,45 @@ class Client(HardwarePresetsMixin):
     def get_distributed_files_dir(self):
         return str(self.resource_server.get_distributed_resource_root())
 
-    def clear_dir(self, dir_type):
+    def clear_dir(self, dir_type, older_than_seconds: int = 0):
         if dir_type == DirectoryType.COMPUTED:
-            return self.remove_computed_files()
+            return self.remove_computed_files(older_than_seconds)
         elif dir_type == DirectoryType.DISTRIBUTED:
-            return self.remove_distributed_files()
+            return self.remove_distributed_files(older_than_seconds)
         elif dir_type == DirectoryType.RECEIVED:
-            return self.remove_received_files()
+            return self.remove_received_files(older_than_seconds)
         raise Exception("Unknown dir type: {}".format(dir_type))
 
-    def remove_computed_files(self):
+    def remove_computed_files(self, older_than_seconds: int = 0):
         dir_manager = DirManager(self.datadir)
-        dir_manager.clear_dir(self.get_computed_files_dir())
+        dir_manager.clear_dir(
+            self.get_computed_files_dir(), older_than_seconds)
 
-    def remove_distributed_files(self):
+    def remove_distributed_files(self, older_than_seconds: int = 0):
         dir_manager = DirManager(self.datadir)
-        dir_manager.clear_dir(self.get_distributed_files_dir())
+        dir_manager.clear_dir(self.get_distributed_files_dir(),
+                              older_than_seconds)
 
-    def remove_received_files(self):
+    def remove_received_files(self, older_than_seconds: int = 0):
         dir_manager = DirManager(self.datadir)
-        dir_manager.clear_dir(self.get_received_files_dir())
+        dir_manager.clear_dir(
+            self.get_received_files_dir(), older_than_seconds)
 
     def remove_task(self, task_id):
         self.p2pservice.remove_task(task_id)
 
     def remove_task_header(self, task_id):
         self.task_server.remove_task_header(task_id)
+
+    def clean_old_tasks(self):
+        now = get_timestamp_utc()
+        for task in self.get_tasks():
+            deadline = task['time_started'] \
+                + string_to_timeout(task['timeout'])\
+                + self.config_desc.clean_tasks_older_than_seconds
+            if deadline <= now:
+                logger.info('Task %s got too old. Deleting.', task['id'])
+                self.delete_task(task['id'])
 
     def get_known_tasks(self):
         headers = {}
@@ -866,6 +1047,7 @@ class Client(HardwarePresetsMixin):
 
     @inlineCallbacks
     def run_benchmark(self, env_id):
+        logger.info('Running benchmarks ...')
         deferred = Deferred()
 
         if env_id != DefaultEnvironment.get_id():
@@ -911,9 +1093,8 @@ class Client(HardwarePresetsMixin):
         self.p2pservice.push_local_rank(node_id, loc_rank)
 
     def check_payments(self):
-        if not self.transaction_system:
-            return
-        after_deadline_nodes = self.transaction_system.check_payments()
+        after_deadline_nodes = \
+            self.transaction_system.get_nodes_with_overdue_payments()
         for node_id in after_deadline_nodes:
             Trust.PAYMENT.decrease(node_id)
 
@@ -923,7 +1104,7 @@ class Client(HardwarePresetsMixin):
 
     @staticmethod
     def get_task_presets(task_type):
-        log.info("Loading presets for {}".format(task_type))
+        logger.info("Loading presets for {}".format(task_type))
         return taskpreset.get_task_presets(task_type)
 
     @staticmethod
@@ -952,133 +1133,10 @@ class Client(HardwarePresetsMixin):
 
     def __get_nodemetadatamodel(self):
         return NodeMetadataModel(
-            self.get_client_id(),
-            self.session_id,
-            sys.platform,
-            APP_VERSION,
-            self.config_desc
+            client=self,
+            os=sys.platform,
+            ver=golem.__version__
         )
-
-    def __try_to_change_to_number(
-        self,
-        old_value,
-        new_value,
-        to_int=False,
-        to_float=False,
-        name="Config"
-    ):
-        try:
-            if to_int:
-                new_value = int(new_value)
-            elif to_float:
-                new_value = float(new_value)
-        except ValueError:
-            log.warning("%s value '%s' is not a number", name, new_value)
-            new_value = old_value
-        return new_value
-
-    def __do_work(self):
-        if not self.p2pservice:
-            return
-
-        if self.config_desc.send_pings:
-            self.p2pservice.ping_peers(self.config_desc.pings_interval)
-
-        try:
-            self.p2pservice.sync_network()
-        except Exception:
-            log.exception("p2pservice.sync_network failed")
-        try:
-            self.task_server.sync_network()
-        except Exception:
-            log.exception("task_server.sync_network failed")
-        try:
-            self.resource_server.sync_network()
-        except Exception:
-            log.exception("resource_server.sync_network failed")
-        try:
-            self.ranking.sync_network()
-        except Exception:
-            log.exception("ranking.sync_network failed")
-        try:
-            self.check_payments()
-        except Exception:
-            log.exception("check_payments failed")
-
-    @inlineCallbacks
-    def __publish_events(self):
-        now = time.time()
-        delta = now - self.last_nss_time
-
-        if delta > max(self.config_desc.node_snapshot_interval, 1):
-            dispatcher.send(
-                signal='golem.monitor',
-                event='stats_snapshot',
-                known_tasks=self.get_task_count(),
-                supported_tasks=self.get_supported_task_count(),
-                stats=self.task_server.task_computer.stats,
-            )
-            dispatcher.send(
-                signal='golem.monitor',
-                event='task_computer_snapshot',
-                task_computer=self.task_server.task_computer,
-            )
-            # with self.snapshot_lock:
-            #     self.__make_node_state_snapshot()
-            #     self.manager_server.sendStateMessage(self.last_node_state_snapshot)
-            self.last_nss_time = time.time()
-
-        delta = now - self.last_net_check_time
-        if delta >= self.config_desc.network_check_interval:
-            self.last_net_check_time = time.time()
-            self._publish(Network.evt_connection, self.connection_status())
-
-        if now - self.last_tasks_time >= PUBLISH_TASKS_INTERVAL:
-            self._publish(Task.evt_task_list, self.get_tasks())
-
-        if now - self.last_balance_time >= PUBLISH_BALANCE_INTERVAL:
-            try:
-                gnt, av_gnt, eth = yield self.get_balance()
-            except Exception as exc:
-                log.debug('Error retrieving balance: {}'.format(exc))
-            else:
-                self._publish(Payments.evt_balance, {
-                    'GNT': str(gnt),
-                    'GNT_available': str(av_gnt),
-                    'ETH': str(eth)
-                })
-
-    def __make_node_state_snapshot(self, is_running=True):
-        peers_num = len(self.p2pservice.peers)
-        last_network_messages = self.p2pservice.get_last_messages()
-
-        if self.task_server:
-            tasks_num = len(self.task_server.task_keeper.task_headers)
-            r_tasks_progs = self.task_server.task_computer.get_progresses()
-            l_tasks_progs = self.task_server.task_manager.get_progresses()
-            last_task_messages = self.task_server.get_last_messages()
-            self.last_node_state_snapshot = NodeStateSnapshot(
-                is_running,
-                self.config_desc.node_name,
-                peers_num,
-                tasks_num,
-                self.p2pservice.node.pub_addr,
-                self.p2pservice.node.pub_port,
-                last_network_messages,
-                last_task_messages,
-                r_tasks_progs,
-                l_tasks_progs
-            )
-        else:
-            self.last_node_state_snapshot = NodeStateSnapshot(
-                self.config_desc.node_name,
-                peers_num
-            )
-
-        if self.nodes_manager_client:
-            self.nodes_manager_client.send_client_state_snapshot(
-                self.last_node_state_snapshot
-            )
 
     def connection_status(self):
         listen_port = self.get_p2p_port()
@@ -1089,10 +1147,11 @@ class Client(HardwarePresetsMixin):
 
         messages = []
 
-        if self.node.port_status:
-            statuses = self.node.port_status.split('\n')
-            failures = [e for e in statuses if e.find('open') == -1]
-            messages.append("Port " + ", ".join(failures) + ".")
+        if self.node.port_statuses:
+            status = ", ".join(
+                "{}: {}".format(port, status)
+                for port, status in self.node.port_statuses.items())
+            messages.append("Port {}.".format(status))
 
         if self.get_connected_peers():
             messages.append("Connected")
@@ -1120,7 +1179,7 @@ class Client(HardwarePresetsMixin):
 
     @staticmethod
     def get_golem_version():
-        return APP_VERSION
+        return golem.__version__
 
     @staticmethod
     def get_golem_status():
@@ -1137,7 +1196,6 @@ class Client(HardwarePresetsMixin):
     def __lock_datadir(self):
         if not path.exists(self.datadir):
             # Create datadir if not exists yet.
-            # TODO: It looks we have the same code in many places
             makedirs(self.datadir)
         self.__datadir_lock = open(path.join(self.datadir, "LOCK"), 'w')
         flags = filelock.LOCK_EX | filelock.LOCK_NB
@@ -1154,3 +1212,147 @@ class Client(HardwarePresetsMixin):
         except Exception:
             pass
         self.__datadir_lock.close()
+
+    @staticmethod
+    def enable_talkback(value):
+        enable_sentry_logger(value)
+
+
+class DoWorkService(LoopingCallService):
+    _client = None  # type: Client
+
+    def __init__(self, client: Client):
+        super().__init__(interval_seconds=1)
+        self._client = client
+        self._check_ts = {}
+
+    def start(self):
+        super().start(now=False)
+
+    def _run(self):
+        # TODO: split it into separate services. Issue #2431
+
+        if self._client.config_desc.send_pings:
+            self._client.p2pservice.ping_peers(
+                self._client.config_desc.pings_interval)
+
+        try:
+            self._client.p2pservice.sync_network()
+        except Exception:
+            logger.exception("p2pservice.sync_network failed")
+        try:
+            self._client.task_server.sync_network()
+        except Exception:
+            logger.exception("task_server.sync_network failed")
+        try:
+            self._client.resource_server.sync_network()
+        except Exception:
+            logger.exception("resource_server.sync_network failed")
+        try:
+            self._client.ranking.sync_network()
+        except Exception:
+            logger.exception("ranking.sync_network failed")
+
+        if self._time_for('payments', PAYMENT_CHECK_INTERVAL):
+            try:
+                self._client.check_payments()
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("check_payments failed")
+
+    def _time_for(self, key: Hashable, interval_seconds: float):
+        now = time.time()
+        if now >= self._check_ts.get(key, 0):
+            self._check_ts[key] = now + interval_seconds
+            return True
+        return False
+
+
+class MonitoringPublisherService(LoopingCallService):
+    _task_server = None  # type: TaskServer
+
+    def __init__(self,
+                 task_server: TaskServer,
+                 interval_seconds: int) -> None:
+        super().__init__(interval_seconds)
+        self._task_server = task_server
+
+    def _run(self):
+        dispatcher.send(
+            signal='golem.monitor',
+            event='stats_snapshot',
+            known_tasks=len(self._task_server.task_keeper.get_all_tasks()),
+            supported_tasks=len(self._task_server.task_keeper.supported_tasks),
+            stats=self._task_server.task_computer.stats,
+        )
+        dispatcher.send(
+            signal='golem.monitor',
+            event='task_computer_snapshot',
+            task_computer=self._task_server.task_computer,
+        )
+        dispatcher.send(
+            signal='golem.monitor',
+            event='requestor_stats_snapshot',
+            current_stats=(self._task_server.task_manager
+                           .requestor_stats_manager.get_current_stats()),
+            finished_stats=(self._task_server.task_manager
+                            .requestor_stats_manager.get_finished_stats())
+        )
+
+
+class NetworkConnectionPublisherService(LoopingCallService):
+    _client = None  # type: Client
+
+    def __init__(self,
+                 client: Client,
+                 interval_seconds: int) -> None:
+        super().__init__(interval_seconds)
+        self._client = client
+
+    def _run(self):
+        self._client._publish(Network.evt_connection,
+                              self._client.connection_status())
+
+
+class TaskArchiverService(LoopingCallService):
+    _task_archiver = None  # type: TaskArchiver
+
+    def __init__(self,
+                 task_archiver: TaskArchiver) -> None:
+        super().__init__(interval_seconds=TASKARCHIVE_MAINTENANCE_INTERVAL)
+        self._task_archiver = task_archiver
+
+    def _run(self):
+        self._task_archiver.do_maintenance()
+
+
+class ResourceCleanerService(LoopingCallService):
+    _client = None  # type: Client
+    older_than_seconds = 0  # type: int
+
+    def __init__(self,
+                 client: Client,
+                 interval_seconds: int,
+                 older_than_seconds: int) -> None:
+        super().__init__(interval_seconds)
+        self._client = client
+        self.older_than_seconds = older_than_seconds
+
+    def _run(self):
+        # TODO: is any synchronization needed here? golemcli has none.
+        # Issue #2432
+        self._client.remove_computed_files(self.older_than_seconds)
+        self._client.remove_distributed_files(self.older_than_seconds)
+        self._client.remove_received_files(self.older_than_seconds)
+
+
+class TaskCleanerService(LoopingCallService):
+    _client = None  # type: Client
+
+    def __init__(self,
+                 client: Client,
+                 interval_seconds: int) -> None:
+        super().__init__(interval_seconds)
+        self._client = client
+
+    def _run(self):
+        self._client.clean_old_tasks()

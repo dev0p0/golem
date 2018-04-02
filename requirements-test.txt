@@ -1,2 +1,7 @@
-mock
-pytest
+freezegun
+pytest==3.3.1
+pytest-cov
+codecov
+flake8
+factory-boy==2.9.2
+pylint==1.7.6

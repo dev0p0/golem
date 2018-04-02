@@ -1,31 +1,37 @@
-
 import logging
 import math
 import os
 import random
-from collections import OrderedDict
-
-
 import time
-from PIL import Image, ImageChops
+from collections import OrderedDict
+from copy import copy
 
+import numpy
+from PIL import Image, ImageChops, ImageFile
+
+import apps.blender.resources.blenderloganalyser as log_analyser
+from apps.blender.blenderenvironment import BlenderEnvironment
+from apps.blender.resources.scenefileeditor import generate_blender_crop_file
+from apps.blender.task.verifier import BlenderVerifier
 from apps.core.task import coretask
+from apps.core.task.coretask import CoreTaskTypeInfo
+from apps.rendering.resources.imgrepr import load_as_pil
+from apps.rendering.resources.renderingtaskcollector import \
+    RenderingTaskCollector
+from apps.rendering.resources.utils import handle_image_error, handle_none
+from apps.rendering.task.framerenderingtask import FrameRenderingTask, \
+    FrameRenderingTaskBuilder, FrameRendererOptions
+from apps.rendering.task.renderingtask import PREVIEW_EXT, PREVIEW_X, PREVIEW_Y
+from apps.rendering.task.renderingtaskstate import RenderingTaskDefinition, \
+    RendererDefaults
 from golem.core.common import to_unicode
 from golem.core.fileshelper import has_ext
 from golem.resource.dirmanager import DirManager
 from golem.task.taskstate import SubtaskStatus, TaskStatus
 
-from apps.blender.blenderenvironment import BlenderEnvironment
-import apps.blender.resources.blenderloganalyser as log_analyser
-from apps.blender.resources.scenefileeditor import generate_blender_crop_file
-from apps.blender.task.verificator import BlenderVerificator
-from apps.core.task.coretask import CoreTaskTypeInfo, AcceptClientVerdict, CoreTask
-from apps.rendering.resources.imgrepr import load_as_pil
-from apps.rendering.resources.renderingtaskcollector import RenderingTaskCollector
-from apps.rendering.task.framerenderingtask import FrameRenderingTask, FrameRenderingTaskBuilder, FrameRendererOptions
-from apps.rendering.task.renderingtask import PREVIEW_EXT, PREVIEW_X, PREVIEW_Y
-from apps.rendering.task.renderingtaskstate import RenderingTaskDefinition, RendererDefaults
-
+# Allow loading truncated images.
+# https://github.com/golemfactory/golem/issues/2059
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 logger = logging.getLogger("apps.blender")
 
@@ -66,13 +72,15 @@ class PreviewUpdater(object):
     def update_preview(self, subtask_path, subtask_number):
         if subtask_number not in self.chunks:
             self.chunks[subtask_number] = subtask_path
-        
-        try:
-            img = load_as_pil(subtask_path)
+
+        with handle_image_error(logger) as handler_result, \
+                handle_none(load_as_pil(subtask_path),
+                            raise_if_none=IOError("load_as_pil failed")) \
+                as subtask_img:
 
             offset = self.get_offset(subtask_number)
             if subtask_number == self.perfectly_placed_subtasks + 1:
-                _, img_y = img.size
+                _, img_y = subtask_img.size
                 self.perfect_match_area_y += img_y
                 self.perfectly_placed_subtasks += 1
 
@@ -83,25 +91,22 @@ class PreviewUpdater(object):
             else:
                 height = self.expected_offsets[subtask_number + 1] - \
                          self.expected_offsets[subtask_number]
-            
-            img = img.resize((self.preview_res_x, height),
-                             resample=Image.BILINEAR)
 
-            if not os.path.exists(self.preview_file_path) \
-               or len(self.chunks) == 1:
-                img_offset = Image.new("RGB", (self.preview_res_x,
-                                               self.preview_res_y))
-                img_offset.paste(img, (0, offset))
-                img_offset.save(self.preview_file_path, PREVIEW_EXT)
-                img_offset.close()
-            else:
-                img_current = Image.open(self.preview_file_path)
-                img_current.paste(img, (0, offset))
-                img_current.save(self.preview_file_path, PREVIEW_EXT)
-                img_current.close()
-            img.close()
-        except Exception:
-            logger.exception("Error in Blender update preview:")
+            with subtask_img.resize((self.preview_res_x, height),
+                                    resample=Image.BILINEAR) \
+                    as subtask_img_resized:
+                def open_or_create_image():
+                    if not os.path.exists(self.preview_file_path) \
+                            or len(self.chunks) == 1:
+                        return Image.new("RGB", (self.preview_res_x,
+                                                 self.preview_res_y))
+                    return Image.open(self.preview_file_path)
+
+                with open_or_create_image() as preview_img:
+                    preview_img.paste(subtask_img_resized, (0, offset))
+                    preview_img.save(self.preview_file_path, PREVIEW_EXT)
+
+        if not handler_result.success:
             return
 
         if subtask_number == self.perfectly_placed_subtasks and \
@@ -114,23 +119,22 @@ class PreviewUpdater(object):
         self.perfect_match_area_y = 0
         self.perfectly_placed_subtasks = 0
         if os.path.exists(self.preview_file_path):
-            img = Image.new("RGB", (self.preview_res_x, self.preview_res_y))
-            img.save(self.preview_file_path, PREVIEW_EXT)
-            img.close()
+            with handle_image_error(logger), \
+                    Image.new("RGB", (self.preview_res_x, self.preview_res_y)) \
+                    as img:
+                img.save(self.preview_file_path, PREVIEW_EXT)
 
 
 class BlenderTaskTypeInfo(CoreTaskTypeInfo):
     """ Blender App descryption that can be used by interface to define
     parameters and task build
     """
-    def __init__(self, dialog, customizer):
+    def __init__(self):
         super(BlenderTaskTypeInfo, self).__init__("Blender",
                                                   RenderingTaskDefinition,
                                                   BlenderDefaults(),
                                                   BlenderRendererOptions,
-                                                  BlenderRenderTaskBuilder,
-                                                  dialog,
-                                                  customizer)
+                                                  BlenderRenderTaskBuilder)
 
         self.output_formats = ["PNG", "TGA", "EXR", "JPEG", "BMP"]
         self.output_file_ext = ["blend"]
@@ -320,7 +324,7 @@ class BlenderRendererOptions(FrameRendererOptions):
 
 class BlenderRenderTask(FrameRenderingTask):
     ENVIRONMENT_CLASS = BlenderEnvironment
-    VERIFICATOR_CLASS = BlenderVerificator
+    VERIFIER_CLASS = BlenderVerifier
 
     BLENDER_MIN_BOX = [8, 8]
 
@@ -328,19 +332,23 @@ class BlenderRenderTask(FrameRenderingTask):
     # Task methods #
     ################
     def __init__(self, task_definition, **kwargs):
-        self.compositing = task_definition.options.compositing
         self.preview_updater = None
         self.preview_updaters = None
 
         FrameRenderingTask.__init__(self, task_definition=task_definition,
                                     **kwargs)
 
-        definition = self.task_definition
-        self.verificator.compositing = self.compositing
-        self.verificator.output_format = self.output_format
-        self.verificator.src_code = self.src_code
-        self.verificator.docker_images = definition.docker_images
-        self.verificator.verification_timeout = definition.subtask_timeout
+        # https://github.com/golemfactory/golem/issues/2388
+        self.compositing = False
+        return
+
+        self.compositing = task_definition.options.compositing \
+            and self.use_frames \
+            and (self.total_tasks <= len(self.frames))
+        if self.compositing != task_definition.options.compositing:
+            logger.warning("Task %s: Compositing not supported "
+                           "for this type of task, turning compositing off",
+                           task_definition.task_id)
 
     def initialize(self, dir_manager):
         super(BlenderRenderTask, self).initialize(dir_manager)
@@ -398,6 +406,11 @@ class BlenderRenderTask(FrameRenderingTask):
             min_y = 0.0
             max_y = 1.0
 
+        #  Blender is using single precision math, we use numpy to emulate this.
+        #  Send already converted values to blender.
+        min_y = numpy.float32(min_y)
+        max_y = numpy.float32(max_y)
+
         script_src = generate_blender_crop_file(
             resolution=(self.res_x, self.res_y),
             borders_x=(0.0, 1.0),
@@ -416,12 +429,23 @@ class BlenderRenderTask(FrameRenderingTask):
                       "output_format": self.output_format,
                       }
 
-        hash = "{}".format(random.getrandbits(128))
-        self.subtasks_given[hash] = extra_data
-        self.subtasks_given[hash]['status'] = SubtaskStatus.starting
-        self.subtasks_given[hash]['perf'] = perf_index
-        self.subtasks_given[hash]['node_id'] = node_id
-        self.subtasks_given[hash]['parts'] = parts
+        subtask_id = self.create_subtask_id()
+        self.subtasks_given[subtask_id] = copy(extra_data)
+        self.subtasks_given[subtask_id]['subtask_id'] = subtask_id
+        self.subtasks_given[subtask_id]['status'] = SubtaskStatus.starting
+        self.subtasks_given[subtask_id]['perf'] = perf_index
+        self.subtasks_given[subtask_id]['node_id'] = node_id
+        self.subtasks_given[subtask_id]['parts'] = parts
+        self.subtasks_given[subtask_id]['res_x'] = self.res_x
+        self.subtasks_given[subtask_id]['res_y'] = self.res_y
+        self.subtasks_given[subtask_id]['use_frames'] = self.use_frames
+        self.subtasks_given[subtask_id]['all_frames'] = self.frames
+        self.subtasks_given[subtask_id]['crop_window'] = (0.0, 1.0, min_y,
+                                                          max_y)
+        self.subtasks_given[subtask_id]['subtask_timeout'] = \
+            self.header.subtask_timeout
+        self.subtasks_given[subtask_id]['tmp_dir'] = self.tmp_dir
+        # FIXME issue #1955
 
         part = self._count_part(start_task, parts)
 
@@ -432,14 +456,16 @@ class BlenderRenderTask(FrameRenderingTask):
             state.status = TaskStatus.computing
             state.started = state.started or time.time()
 
-            self.frames_subtasks[frame_key][part - 1] = hash
+            self.frames_subtasks[frame_key][part - 1] = subtask_id
 
         if not self.use_frames:
             self._update_task_preview()
         else:
             self._update_frame_task_preview()
 
-        ctd = self._new_compute_task_def(hash, extra_data, perf_index=perf_index)
+        ctd = self._new_compute_task_def(subtask_id, extra_data,
+                                         perf_index=perf_index)
+        self.subtasks_given[subtask_id]['ctd'] = ctd
         return self.ExtraData(ctd=ctd)
 
     def restart(self):
@@ -519,19 +545,19 @@ class BlenderRenderTask(FrameRenderingTask):
                               final=False):
         num = self.frames.index(frame_num)
         if final:
-            img = load_as_pil(new_chunk_file_path)
-            scaled = img.resize((int(round(self.res_x * self.scale_factor)),
-                                 int(round(self.res_y * self.scale_factor))),
-                                resample=Image.BILINEAR)
+            with handle_image_error(logger), \
+                    handle_none(load_as_pil(new_chunk_file_path),
+                                raise_if_none=IOError("load_as_pil failed")) \
+                    as img, \
+                    img.resize((int(round(self.res_x * self.scale_factor)),
+                                int(round(self.res_y * self.scale_factor))),
+                               resample=Image.BILINEAR) as scaled:
 
-            preview_task_file_path = self._get_preview_task_file_path(num)
-            self.last_preview_path = preview_task_file_path
+                preview_task_file_path = self._get_preview_task_file_path(num)
+                self.last_preview_path = preview_task_file_path
 
-            scaled.save(preview_task_file_path, PREVIEW_EXT)
-            scaled.save(self._get_preview_file_path(num), PREVIEW_EXT)
-
-            scaled.close()
-            img.close()
+                scaled.save(preview_task_file_path, PREVIEW_EXT)
+                scaled.save(self._get_preview_file_path(num), PREVIEW_EXT)
         else:
             self.preview_updaters[num].update_preview(new_chunk_file_path, part)
             self._update_frame_task_preview()
@@ -544,7 +570,9 @@ class BlenderRenderTask(FrameRenderingTask):
             collector = CustomCollector(paste=True, width=self.res_x, height=self.res_y)
             for file in self.collected_file_names.values():
                 collector.add_img_file(file)
-            collector.finalize().save(output_file_name, self.output_format)
+            with handle_image_error(logger), \
+                    collector.finalize() as image:
+                image.save(output_file_name, self.output_format)
         else:
             self._put_collected_files_together(os.path.join(self.tmp_dir, output_file_name),
                                                list(self.collected_file_names.values()), "paste")
@@ -580,13 +608,14 @@ class BlenderRenderTask(FrameRenderingTask):
             collector = CustomCollector(paste=True, width=self.res_x, height=self.res_y)
             for file in collected.values():
                 collector.add_img_file(file)
-            collector.finalize().save(output_file_name, self.output_format)
+            with handle_image_error(logger), \
+                    collector.finalize() as image:
+                image.save(output_file_name, self.output_format)
         else:
             self._put_collected_files_together(output_file_name, list(collected.values()), "paste")
         self.collected_file_names[frame_num] = output_file_name
         self._update_frame_preview(output_file_name, frame_num, final=True)
         self._update_frame_task_preview()
-
 
 class BlenderRenderTaskBuilder(FrameRenderingTaskBuilder):
     """ Build new Blender tasks using RenderingTaskDefintions and BlenderRendererOptions as taskdefinition
@@ -619,14 +648,14 @@ class CustomCollector(RenderingTaskCollector):
         self.current_offset = 0
     
     def _paste_image(self, final_img, new_part, num):
-        img_offset = Image.new("RGB", (self.width, self.height))
-        offset = self.current_offset
-        _, new_img_res_y = new_part.size
-        self.current_offset += new_img_res_y
-        img_offset.paste(new_part, (0, offset))
-        result = ImageChops.add(final_img, img_offset)
-        img_offset.close()
-        return result
+        with handle_image_error(logger), \
+                Image.new("RGB", (self.width, self.height)) as img_offset:
+            offset = self.current_offset
+            _, new_img_res_y = new_part.size
+            self.current_offset += new_img_res_y
+            img_offset.paste(new_part, (0, offset))
+            result = ImageChops.add(final_img, img_offset)
+            return result
 
 
 def generate_expected_offsets(parts, res_x, res_y):
@@ -670,4 +699,3 @@ def get_min_max_y(task_num, parts, res_y):
 
 
     
-

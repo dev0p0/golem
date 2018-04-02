@@ -1,15 +1,16 @@
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_submodules
 
 hiddenimports = collect_submodules('golem') + \
-                collect_submodules('gui') + \
-                collect_submodules('apps') + ['Cryptodome', 'xml', 'scrypt']
+                collect_submodules('apps') + \
+                ['Cryptodome', 'xml', 'scrypt', 'mock']
 
-datas = collect_data_files('gui') + [
+datas = [
     ('loggingconfig.py', '.'),
-    ('gui/view/*', 'gui/view'),
-    ('apps/*.ini', 'apps'),
+    ('apps/*.ini', 'apps/'),
     ('apps/rendering/benchmark/minilight/cornellbox.ml.txt',
-     'apps/rendering/benchmark/minilight'),
+     'apps/rendering/benchmark/minilight/'),
+    ('apps/rendering/resources/scripts/runner.py',
+     'apps/rendering/resources/scripts/'),
     ('apps/blender/resources/scripts/blendercrop.py.template',
      'apps/blender/resources/scripts/'),
     ('apps/blender/resources/scripts/docker_blendertask.py',
@@ -24,4 +25,7 @@ datas = collect_data_files('gui') + [
      'apps/dummy/resources/code_dir/'),
     ('apps/dummy/test_data/in.data',
      'apps/dummy/test_data/'),
+    ('golem/RELEASE-VERSION', 'golem/'),
+    ('golem/TERMS.html', 'golem/'),
+    ('golem/database/schemas/*.py', 'golem/database/schemas/'),
 ]

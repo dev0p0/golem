@@ -1,33 +1,38 @@
 import logging
 import pickle
 import time
-
 from pathlib import Path
+from typing import Optional, Dict, List
+
+from golem_messages.message import ComputeTaskDef
 from pydispatch import dispatcher
 
 from apps.appsmanager import AppsManager
+from apps.core.task.coretask import CoreTask
 from golem.core.common import HandleKeyError, get_timestamp_utc, \
-    timeout_to_deadline, to_unicode, update_dict
+    to_unicode, update_dict
 from golem.manager.nodestatesnapshot import LocalTaskStateSnapshot
 from golem.network.transport.tcpnetwork import SocketAddress
 from golem.resource.dirmanager import DirManager
-from golem.resource.hyperdrive.resourcesmanager import HyperdriveResourceManager
+from golem.resource.hyperdrive.resourcesmanager import \
+    HyperdriveResourceManager
 from golem.task.result.resultmanager import EncryptedResultPackageManager
-from golem.task.taskbase import ComputeTaskDef, TaskEventListener, Task, ResourceType
+from golem.task.taskbase import TaskEventListener, Task
 from golem.task.taskkeeper import CompTaskKeeper, compute_subtask_value
+from golem.task.taskrequestorstats import RequestorTaskStatsManager
 from golem.task.taskstate import TaskState, TaskStatus, SubtaskStatus, \
-    SubtaskState
+    SubtaskState, Operation, TaskOp, SubtaskOp, OtherOp
 
 logger = logging.getLogger(__name__)
 
 
 def log_subtask_key_error(*args, **kwargs):
-    logger.warning("This is not my subtask {}".format(args[1]))
+    logger.warning("This is not my subtask %r", args[1])
     return None
 
 
 def log_task_key_error(*args, **kwargs):
-    logger.warning("This is not my task {}".format(args[1]))
+    logger.warning("This is not my task %r", args[1])
     return None
 
 
@@ -49,49 +54,65 @@ class TaskManager(TaskEventListener):
     handle_task_key_error = HandleKeyError(log_task_key_error)
     handle_subtask_key_error = HandleKeyError(log_subtask_key_error)
 
-    def __init__(self, node_name, node, keys_auth, listen_address="",
-                 listen_port=0, root_path="res", use_distributed_resources=True,
-                 tasks_dir="tasks", task_persistence=False):
-        super(TaskManager, self).__init__()
+    class Error(Exception):
+        pass
+
+    class AlreadyRestartedError(Error):
+        pass
+
+    def __init__(
+            self, node_name, node, keys_auth, listen_address="",
+            listen_port=0, root_path="res", use_distributed_resources=True,
+            tasks_dir="tasks", task_persistence=True):
+        super().__init__()
 
         self.apps_manager = AppsManager()
         self.apps_manager.load_apps()
 
         apps = list(self.apps_manager.apps.values())
-        task_types = [app.task_type_info(None, app.controller) for app in apps]
+        task_types = [app.task_type_info() for app in apps]
         self.task_types = {t.name.lower(): t for t in task_types}
 
         self.node_name = node_name
         self.node = node
         self.keys_auth = keys_auth
-        self.key_id = keys_auth.get_key_id()
+        self.key_id = keys_auth.key_id
 
-        self.tasks = {}
-        self.tasks_states = {}
-        self.subtask2task_mapping = {}
+        self.tasks = {}  # type: Dict[str, Task]
+        self.tasks_states = {}  # type: Dict[str, TaskState]
+        self.subtask2task_mapping = {}  # type: Dict[str, str]
 
         self.listen_address = listen_address
         self.listen_port = listen_port
 
-        # FIXME Remove this variable and make task persistance obligatory after it is more tested
-        # Remember to also remove it from init params
         self.task_persistence = task_persistence
 
-        self.tasks_dir = Path(tasks_dir)
+        tasks_dir = Path(tasks_dir)
+        self.tasks_dir = tasks_dir / "tmanager"
         if not self.tasks_dir.is_dir():
             self.tasks_dir.mkdir(parents=True)
         self.root_path = root_path
         self.dir_manager = DirManager(self.get_task_manager_root())
 
-        resource_manager = HyperdriveResourceManager(self.dir_manager,
-                                                     resource_dir_method=self.dir_manager.get_task_temporary_dir)
-        self.task_result_manager = EncryptedResultPackageManager(resource_manager)
+        resource_manager = HyperdriveResourceManager(
+            self.dir_manager,
+            resource_dir_method=self.dir_manager.get_task_temporary_dir,
+        )
+        self.task_result_manager = EncryptedResultPackageManager(
+            resource_manager
+        )
 
         self.activeStatus = [TaskStatus.computing, TaskStatus.starting,
-                             TaskStatus.waiting, TaskStatus.restarted]
+                             TaskStatus.waiting]
         self.use_distributed_resources = use_distributed_resources
 
-        self.comp_task_keeper = CompTaskKeeper(self.tasks_dir, persist=self.task_persistence)
+        self.comp_task_keeper = CompTaskKeeper(
+            tasks_dir,
+            persist=self.task_persistence,
+        )
+
+        self.requestor_stats_manager = RequestorTaskStatsManager()
+
         if self.task_persistence:
             self.restore_tasks()
 
@@ -99,18 +120,15 @@ class TaskManager(TaskEventListener):
         return self.root_path
 
     def create_task(self, dictionary, minimal=False):
-        # FIXME: Backward compatibility only. Remove after upgrading GUI.
-        if not isinstance(dictionary, dict):
-            return dictionary
-
         type_name = dictionary['type'].lower()
         task_type = self.task_types[type_name]
         builder_type = task_type.task_builder_type
 
         definition = builder_type.build_definition(task_type, dictionary,
                                                    minimal)
-        builder = builder_type(self.node_name, definition,
-                               self.root_path, self.dir_manager)
+        definition.task_id = CoreTask.create_task_id(self.keys_auth.public_key)
+        builder = builder_type(self.node_name, definition, self.root_path,
+                               self.dir_manager)
 
         return Task.build_task(builder)
 
@@ -122,7 +140,8 @@ class TaskManager(TaskEventListener):
         return task_type.task_builder_type.build_dictionary(definition)
 
     def add_new_task(self, task):
-        if task.header.task_id in self.tasks:
+        task_id = task.header.task_id
+        if task_id in self.tasks:
             raise RuntimeError("Task {} has been already added"
                                .format(task.header.task_id))
         if not self.key_id:
@@ -131,88 +150,142 @@ class TaskManager(TaskEventListener):
                                                self.listen_port):
             raise IOError("Incorrect socket address")
 
-        task.task_status = TaskStatus.notStarted
         task.header.task_owner_address = self.listen_address
         task.header.task_owner_port = self.listen_port
         task.header.task_owner_key_id = self.key_id
         task.header.task_owner = self.node
         task.header.signature = self.sign_task_header(task.header)
 
-        self.dir_manager.clear_temporary(task.header.task_id)
-        self.dir_manager.get_task_temporary_dir(task.header.task_id,
-                                                create=True)
-
         task.create_reference_data_for_task_validation()
+        task.register_listener(self)
+
         ts = TaskState()
         ts.status = TaskStatus.notStarted
         ts.outputs = task.get_output_names()
         ts.total_subtasks = task.get_total_tasks()
         ts.time_started = time.time()
 
-        self.tasks[task.header.task_id] = task
-        self.tasks_states[task.header.task_id] = ts
+        self.tasks[task_id] = task
+        self.tasks_states[task_id] = ts
+        logger.info("Task %s added", task_id)
 
+        self.notice_task_updated(task_id,
+                                 op=TaskOp.CREATED,
+                                 persist=False)
 
     @handle_task_key_error
     def start_task(self, task_id):
-        task = self.tasks[task_id]
         task_state = self.tasks_states[task_id]
 
         if task_state.status != TaskStatus.notStarted:
             raise RuntimeError("Task {} has already been started"
                                .format(task_id))
 
-        task.task_status = TaskStatus.waiting
         task_state.status = TaskStatus.waiting
-        task.register_listener(self)
+        self.notice_task_updated(task_id, op=TaskOp.STARTED)
+        logger.info("Task %s started", task_id)
 
-        if self.task_persistence:
-            self.dump_task(task.header.task_id)
-            logger.info("Task {} added".format(task.header.task_id))
-            self.notice_task_updated(task.header.task_id)
+    def _dump_filepath(self, task_id):
+        return self.tasks_dir / ('%s.pickle' % (task_id,))
 
-    def dump_task(self, task_id):
-        logger.debug('DUMP TASK')
+    def dump_task(self, task_id: str) -> None:
+        logger.debug('DUMP TASK %r', task_id)
         try:
             data = self.tasks[task_id], self.tasks_states[task_id]
-            filepath = self.tasks_dir / ('%s.pickle' % (task_id,))
-            logger.debug('DUMP TASK %r', filepath)
+            filepath = self._dump_filepath(task_id)
+            logger.debug('DUMPING TASK %r', filepath)
             with filepath.open('wb') as f:
                 pickle.dump(data, f, protocol=2)
-        except:
-            logger.exception('DUMP ERROR task_id: %r task: %r state: %r', task_id, self.tasks.get(task_id, '<not found>'), self.tasks_states.get(task_id, '<not found>'))
+            logger.debug('TASK %s DUMPED in %r', task_id, filepath)
+        except Exception as e:
+            logger.exception(
+                'DUMP ERROR task_id: %r task: %r state: %r',
+                task_id, self.tasks.get(task_id, '<not found>'),
+                self.tasks_states.get(task_id, '<not found>'),
+            )
             if filepath.exists():
                 filepath.unlink()
             raise
 
-    def restore_tasks(self):
-        logger.debug('RESTORE TASKS')
+    def remove_dump(self, task_id: str):
+        filepath = self._dump_filepath(task_id)
+        try:
+            filepath.unlink()
+            logger.debug('TASK DUMP with id %s REMOVED from %r',
+                         task_id, filepath)
+        except (FileNotFoundError, OSError) as e:
+            logger.warning("Couldn't remove dump file: %s - %s", filepath, e)
+
+    def restore_tasks(self) -> None:
+        logger.debug('SEARCHING FOR TASKS TO RESTORE')
+        broken_paths = set()
         for path in self.tasks_dir.iterdir():
-            logger.debug('RESTORE TASKS %r', path)
             if not path.suffix == '.pickle':
                 continue
-            logger.debug('RESTORE TASKS really %r', path)
+            logger.debug('RESTORE TASKS %r', path)
+
+            task_id = None
             with path.open('rb') as f:
                 try:
                     task, state = pickle.load(f)
-                    self.tasks[task.header.task_id] = task
-                    self.tasks_states[task.header.task_id] = state
-                except (pickle.UnpicklingError, EOFError, ImportError):
+                    task.register_listener(self)
+
+                    task_id = task.header.task_id
+                    self.tasks[task_id] = task
+                    self.tasks_states[task_id] = state
+
+                    for sub in state.subtask_states.values():
+                        self.subtask2task_mapping[sub.subtask_id] = task
+
+                    logger.debug('TASK %s RESTORED from %r', task_id, path)
+                except (pickle.UnpicklingError, EOFError, ImportError,
+                        KeyError):
                     logger.exception('Problem restoring task from: %s', path)
-                    path.unlink()
-                    continue
-            dispatcher.send(signal='golem.taskmanager', event='task_restored', task=task, state=state)
+                    # On Windows, attempting to remove a file that is in use
+                    # causes an exception to be raised, therefore
+                    # we'll remove broken files later
+                    broken_paths.add(path)
+
+            if task_id is not None:
+                self.notice_task_updated(task_id, op=TaskOp.RESTORED,
+                                         persist=False)
+
+        for path in broken_paths:
+            path.unlink()
 
     @handle_task_key_error
     def resources_send(self, task_id):
         self.tasks_states[task_id].status = TaskStatus.waiting
-        self.tasks[task_id].task_status = TaskStatus.waiting
         self.notice_task_updated(task_id)
         logger.info("Resources for task {} sent".format(task_id))
 
-    def get_next_subtask(self, node_id, node_name, task_id, estimated_performance, price, max_resource_size, max_memory_size, num_cores=0, address=""):
-        """ Assign next subtask from task <task_id> to node with given id <node_id> and name. If subtask is assigned
-        the function is returning a tuple (
+    def got_wants_to_compute(self,
+                             task_id: str,
+                             key_id: str,  # pylint: disable=unused-argument
+                             node_name: str):  # pylint: disable=unused-argument
+        """
+        Updates number of offers to compute task.
+
+        For statistical purposes only, real processing of the offer is done
+        elsewhere. Silently ignores wrong task ids.
+
+        :param str task_id: id of the task in the offer
+        :param key_id: id of the node offering computations
+        :param node_name: name of the node offering computations
+        :return: Nothing
+        :rtype: None
+        """
+        if task_id in self.tasks:
+            self.notice_task_updated(task_id,
+                                     op=TaskOp.WORK_OFFER_RECEIVED,
+                                     persist=False)
+
+    def get_next_subtask(
+            self, node_id, node_name, task_id, estimated_performance, price,
+            max_resource_size, max_memory_size, num_cores=0, address=""):
+        """ Assign next subtask from task <task_id> to node with given
+        id <node_id> and name. If subtask is assigned the function
+        is returning a tuple (
         :param node_id:
         :param node_name:
         :param task_id:
@@ -222,13 +295,19 @@ class TaskManager(TaskEventListener):
         :param max_memory_size:
         :param num_cores:
         :param address:
-        :return (ComputeTaskDef|None, bool, bool): Function returns a triplet. First element is either ComputeTaskDef
-        that describe assigned subtask or None. The second element describes whether the task_id is a wrong task that
-        isn't in task manager register. If task with <task_id> it's a known task then second element of a pair is always
-        False (regardless new subtask was assigned or not). The third element describes whether we're waiting for
-        client's other task results.
+        :return (ComputeTaskDef|None, bool, bool): Function returns a triplet.
+        First element is either ComputeTaskDef that describe assigned subtask
+        or None. The second element describes whether the task_id is a wrong
+        task that isn't in task manager register. If task with <task_id> it's
+        a known task then second element of a pair is always False (regardless
+        new subtask was assigned or not). The third element describes whether
+        we're waiting for client's other task results.
         """
-        logger.debug('get_next_subtask(%r, %r, %r, %r, %r, %r, %r, %r, %r)', node_id, node_name, task_id, estimated_performance, price, max_resource_size, max_memory_size, num_cores, address)
+        logger.debug(
+            'get_next_subtask(%r, %r, %r, %r, %r, %r, %r, %r, %r)',
+            node_id, node_name, task_id, estimated_performance, price,
+            max_resource_size, max_memory_size, num_cores, address,
+        )
         if task_id not in self.tasks:
             logger.info("Cannot find task {} in my tasks".format(task_id))
             return None, True, False
@@ -252,45 +331,60 @@ class TaskManager(TaskEventListener):
                 logger.debug('estimated memory >')
                 return False
             return True
+
         if not has_subtasks():
-            logger.info("Cannot get next task for estimated performance {}".format(estimated_performance))
+            logger.info(
+                "Cannot get next task for estimated performance %r",
+                estimated_performance,
+            )
             return None, False, False
 
-        extra_data = task.query_extra_data(estimated_performance, num_cores, node_id, node_name)
+        extra_data = task.query_extra_data(
+            estimated_performance,
+            num_cores,
+            node_id,
+            node_name
+        )
         if extra_data.should_wait:
             return None, False, True
 
         ctd = extra_data.ctd
 
         def check_compute_task_def():
-            if not isinstance(ctd, ComputeTaskDef) or not ctd.subtask_id:
+            if not isinstance(ctd, ComputeTaskDef) or not ctd['subtask_id']:
                 logger.debug('check ctd: ctd not instance or not subtask_id')
                 return False
-            if task_id != ctd.task_id or ctd.subtask_id in self.subtask2task_mapping:
-                logger.debug('check ctd: %r != %r or %r in self.subtask2task_maping', task_id, ctd.task_id, ctd.subtask_id)
+            if task_id != ctd['task_id'] \
+                    or ctd['subtask_id'] in self.subtask2task_mapping:
+                logger.debug(
+                    'check ctd: %r != %r or %r in self.subtask2task_maping',
+                    task_id, ctd['task_id'], ctd['subtask_id'],
+                )
                 return False
-            if ctd.subtask_id in self.tasks_states[ctd.task_id].subtask_states:
+            if (ctd['subtask_id'] in self.tasks_states[ctd['task_id']].
+                    subtask_states):
                 logger.debug('check ctd: subtask_states')
                 return False
             return True
+
         if not check_compute_task_def():
             return None, False, False
 
-        ctd.key_id = task.header.task_owner_key_id
-        ctd.return_address = task.header.task_owner_address
-        ctd.return_port = task.header.task_owner_port
-        ctd.task_owner = task.header.task_owner
-
-        self.subtask2task_mapping[ctd.subtask_id] = task_id
-        self.__add_subtask_to_tasks_states(node_name, node_id, price, ctd, address)
-        self.notice_task_updated(task_id)
+        self.subtask2task_mapping[ctd['subtask_id']] = task_id
+        self.__add_subtask_to_tasks_states(
+            node_name, node_id, price, ctd, address,
+        )
+        self.notice_task_updated(task_id,
+                                 subtask_id=ctd['subtask_id'],
+                                 op=SubtaskOp.ASSIGNED)
         return ctd, False, extra_data.should_wait
 
     def get_tasks_headers(self):
         ret = []
-        for t in list(self.tasks.values()):
-            if t.needs_computation() and t.task_status in self.activeStatus:
-                ret.append(t.header)
+        for tid, task in self.tasks.items():
+            status = self.tasks_states[tid].status
+            if task.needs_computation() and status in self.activeStatus:
+                ret.append(task.header)
 
         return ret
 
@@ -317,11 +411,11 @@ class TaskManager(TaskEventListener):
             return False
 
     def get_node_id_for_subtask(self, subtask_id):
-        if subtask_id in self.subtask2task_mapping:
-            subtask_state = self.tasks_states[self.subtask2task_mapping[subtask_id]].subtask_states[subtask_id]
-            return subtask_state.computer.node_id
-        else:
+        if subtask_id not in self.subtask2task_mapping:
             return None
+        task = self.subtask2task_mapping[subtask_id]
+        subtask_state = self.tasks_states[task].subtask_states[subtask_id]
+        return subtask_state.computer.node_id
 
     def set_value(self, task_id, subtask_id, value):
         if not isinstance(value, int):
@@ -348,7 +442,8 @@ class TaskManager(TaskEventListener):
         return value
 
     @handle_subtask_key_error
-    def computed_task_received(self, subtask_id, result, result_type):
+    def computed_task_received(self, subtask_id, result, result_type,
+                               verification_finished_):
         task_id = self.subtask2task_mapping[subtask_id]
 
         subtask_state = self.tasks_states[task_id].subtask_states[subtask_id]
@@ -357,35 +452,54 @@ class TaskManager(TaskEventListener):
         if not SubtaskStatus.is_computed(subtask_status):
             logger.warning("Result for subtask {} when subtask state is {}"
                            .format(subtask_id, subtask_status))
-            self.notice_task_updated(task_id)
-            return False
+            self.notice_task_updated(task_id,
+                                     subtask_id=subtask_id,
+                                     op=OtherOp.UNEXPECTED)
+            verification_finished_()
+            return
+        subtask_state.subtask_status = SubtaskStatus.verifying
 
-        self.tasks[task_id].computation_finished(subtask_id, result, result_type)
-        ss = self.tasks_states[task_id].subtask_states[subtask_id]
-        ss.subtask_progress = 1.0
-        ss.subtask_rem_time = 0.0
-        ss.subtask_status = SubtaskStatus.finished
-        ss.stdout = self.tasks[task_id].get_stdout(subtask_id)
-        ss.stderr = self.tasks[task_id].get_stderr(subtask_id)
-        ss.results = self.tasks[task_id].get_results(subtask_id)
+        def verification_finished():
+            ss = self.tasks_states[task_id].subtask_states[subtask_id]
+            ss.subtask_progress = 1.0
+            ss.subtask_rem_time = 0.0
+            ss.subtask_status = SubtaskStatus.finished
+            ss.stdout = self.tasks[task_id].get_stdout(subtask_id)
+            ss.stderr = self.tasks[task_id].get_stderr(subtask_id)
+            ss.results = self.tasks[task_id].get_results(subtask_id)
 
-        if not self.tasks[task_id].verify_subtask(subtask_id):
-            logger.debug("Subtask {} not accepted\n".format(subtask_id))
-            ss.subtask_status = SubtaskStatus.failure
-            self.notice_task_updated(task_id)
-            return False
+            if not self.tasks[task_id].verify_subtask(subtask_id):
+                logger.debug("Subtask %r not accepted\n", subtask_id)
+                ss.subtask_status = SubtaskStatus.failure
+                self.notice_task_updated(
+                    task_id,
+                    subtask_id=subtask_id,
+                    op=SubtaskOp.NOT_ACCEPTED)
+                verification_finished_()
+                return
 
-        if self.tasks_states[task_id].status in self.activeStatus:
-            if not self.tasks[task_id].finished_computation():
-                self.tasks_states[task_id].status = TaskStatus.computing
-            else:
-                if self.tasks[task_id].verify_task():
-                    logger.debug("Task {} accepted".format(task_id))
-                    self.tasks_states[task_id].status = TaskStatus.finished
+            self.notice_task_updated(task_id,
+                                     subtask_id=subtask_id,
+                                     op=SubtaskOp.FINISHED)
+
+            if self.tasks_states[task_id].status in self.activeStatus:
+                if not self.tasks[task_id].finished_computation():
+                    self.tasks_states[task_id].status = TaskStatus.computing
                 else:
-                    logger.debug("Task {} not accepted".format(task_id))
-        self.notice_task_updated(task_id)
-        return True
+                    if self.tasks[task_id].verify_task():
+                        logger.debug("Task %r accepted", task_id)
+                        self.tasks_states[task_id].status = TaskStatus.finished
+                        self.notice_task_updated(task_id, op=TaskOp.FINISHED)
+                    else:
+                        logger.debug("Task %r not accepted", task_id)
+                        self.notice_task_updated(task_id,
+                                                 op=TaskOp.NOT_ACCEPTED)
+
+            verification_finished_()
+
+        self.tasks[task_id].computation_finished(
+            subtask_id, result, result_type, verification_finished
+        )
 
     @handle_subtask_key_error
     def task_computation_failure(self, subtask_id, err):
@@ -397,7 +511,9 @@ class TaskManager(TaskEventListener):
         if not SubtaskStatus.is_computed(subtask_status):
             logger.warning("Result for subtask {} when subtask state is {}"
                            .format(subtask_id, subtask_status))
-            self.notice_task_updated(task_id)
+            self.notice_task_updated(task_id,
+                                     subtask_id=subtask_id,
+                                     op=OtherOp.UNEXPECTED)
             return False
 
         self.tasks[task_id].computation_failed(subtask_id)
@@ -407,7 +523,9 @@ class TaskManager(TaskEventListener):
         ss.subtask_status = SubtaskStatus.failure
         ss.stderr = str(err)
 
-        self.notice_task_updated(task_id)
+        self.notice_task_updated(task_id,
+                                 subtask_id=subtask_id,
+                                 op=SubtaskOp.FAILED)
         return True
 
     def task_result_incoming(self, subtask_id):
@@ -422,7 +540,10 @@ class TaskManager(TaskEventListener):
                 task.result_incoming(subtask_id)
                 states.subtask_status = SubtaskStatus.downloading
 
-                self.notify_update_task(task_id)
+                self.notice_task_updated(
+                    task_id,
+                    subtask_id=subtask_id,
+                    op=SubtaskOp.RESULT_DOWNLOADING)
             else:
                 logger.error("Unknown task id: {}".format(task_id))
         else:
@@ -439,9 +560,8 @@ class TaskManager(TaskEventListener):
             cur_time = get_timestamp_utc()
             if cur_time > th.deadline:
                 logger.info("Task {} dies".format(th.task_id))
-                t.task_stats = TaskStatus.timeout
                 self.tasks_states[th.task_id].status = TaskStatus.timeout
-                self.notice_task_updated(th.task_id)
+                self.notice_task_updated(th.task_id, op=TaskOp.TIMEOUT)
             ts = self.tasks_states[th.task_id]
             for s in list(ts.subtask_states.values()):
                 if SubtaskStatus.is_computed(s.subtask_status):
@@ -451,7 +571,9 @@ class TaskManager(TaskEventListener):
                         nodes_with_timeouts.append(s.computer.node_id)
                         t.computation_failed(s.subtask_id)
                         s.stderr = "[GOLEM] Timeout"
-                        self.notice_task_updated(th.task_id)
+                        self.notice_task_updated(th.task_id,
+                                                 subtask_id=s.subtask_id,
+                                                 op=SubtaskOp.TIMEOUT)
         return nodes_with_timeouts
 
     def get_progresses(self):
@@ -459,47 +581,50 @@ class TaskManager(TaskEventListener):
 
         for t in list(self.tasks.values()):
             if t.get_progress() < 1.0:
-                ltss = LocalTaskStateSnapshot(t.header.task_id, t.get_total_tasks(),
-                                              t.get_active_tasks(), t.get_progress(), t.short_extra_data_repr(2200.0)) # FIXME in short_extra_data_repr should there be extra data
+                ltss = LocalTaskStateSnapshot(
+                    t.header.task_id,
+                    t.get_total_tasks(),
+                    t.get_active_tasks(),
+                    t.get_progress(),
+                    t.short_extra_data_repr(2200.0)
+                )  # FIXME in short_extra_data_repr should there be extra data
+                # Issue #2460
                 tasks_progresses[t.header.task_id] = ltss
 
         return tasks_progresses
 
     @handle_task_key_error
-    def get_resources(self, task_id, resource_header, resource_type=ResourceType.ZIP):
-        task = self.tasks[task_id]
-        return task.get_resources(resource_header, resource_type)
-
-    @handle_task_key_error
-    def restart_task(self, task_id):
-        logger.info("restarting task")
+    def put_task_in_restarted_state(self, task_id):
+        """
+        When restarting task, it's put in a final state 'restarted' and
+        a new one is created.
+        """
+        task_state = self.tasks_states[task_id]
+        if task_state.status == TaskStatus.restarted:
+            raise self.AlreadyRestartedError()
         self.dir_manager.clear_temporary(task_id)
-        task = self.tasks[task_id]
 
-        task.restart()
-        task.task_status = TaskStatus.restarted
-        self.tasks_states[task_id].status = TaskStatus.restarted
-        task.header.deadline = timeout_to_deadline(
-            task.task_definition.full_task_timeout)
-        self.tasks_states[task_id].time_started = time.time()
-
-        for ss in list(self.tasks_states[task_id].subtask_states.values()):
+        task_state.status = TaskStatus.restarted
+        for ss in self.tasks_states[task_id].subtask_states.values():
             if ss.subtask_status != SubtaskStatus.failure:
                 ss.subtask_status = SubtaskStatus.restarted
 
-        task.header.signature = self.sign_task_header(task.header)
-
-        self.notice_task_updated(task_id)
+        logger.info("Task %s put into restarted state", task_id)
+        self.notice_task_updated(task_id, op=TaskOp.RESTARTED)
 
     @handle_subtask_key_error
     def restart_subtask(self, subtask_id):
         task_id = self.subtask2task_mapping[subtask_id]
         self.tasks[task_id].restart_subtask(subtask_id)
-        self.tasks_states[task_id].status = TaskStatus.computing
-        self.tasks_states[task_id].subtask_states[subtask_id].subtask_status = SubtaskStatus.restarted
-        self.tasks_states[task_id].subtask_states[subtask_id].stderr = "[GOLEM] Restarted"
+        task_state = self.tasks_states[task_id]
+        task_state.status = TaskStatus.computing
+        subtask_state = task_state.subtask_states[subtask_id]
+        subtask_state.subtask_status = SubtaskStatus.restarted
+        subtask_state.stderr = "[GOLEM] Restarted"
 
-        self.notice_task_updated(task_id)
+        self.notice_task_updated(task_id,
+                                 subtask_id=subtask_id,
+                                 op=SubtaskOp.RESTARTED)
 
     @handle_task_key_error
     def restart_frame_subtasks(self, task_id, frame):
@@ -515,20 +640,23 @@ class TaskManager(TaskEventListener):
             subtask_state = task_state.subtask_states[subtask_id]
             subtask_state.subtask_status = SubtaskStatus.restarted
             subtask_state.stderr = "[GOLEM] Restarted"
+            self.notice_task_updated(task_id,
+                                     subtask_id=subtask_id,
+                                     op=SubtaskOp.RESTARTED,
+                                     persist=False)
 
         task.status = TaskStatus.computing
-        self.notice_task_updated(task_id)
+        self.notice_task_updated(task_id, op=OtherOp.FRAME_RESTARTED)
 
     @handle_task_key_error
     def abort_task(self, task_id):
         self.tasks[task_id].abort()
-        self.tasks[task_id].task_status = TaskStatus.aborted
         self.tasks_states[task_id].status = TaskStatus.aborted
         for sub in list(self.tasks_states[task_id].subtask_states.values()):
             del self.subtask2task_mapping[sub.subtask_id]
         self.tasks_states[task_id].subtask_states.clear()
 
-        self.notice_task_updated(task_id)
+        self.notice_task_updated(task_id, op=TaskOp.ABORTED)
 
     @handle_task_key_error
     def get_output_states(self, task_id):
@@ -545,6 +673,7 @@ class TaskManager(TaskEventListener):
         del self.tasks_states[task_id]
 
         self.dir_manager.clear_temporary(task_id)
+        self.remove_dump(task_id)
 
     @handle_task_key_error
     def query_task_state(self, task_id):
@@ -555,7 +684,8 @@ class TaskManager(TaskEventListener):
         ts.elapsed_time = time.time() - ts.time_started
 
         if ts.progress > 0.0:
-            ts.remaining_time = (ts.elapsed_time / ts.progress) - ts.elapsed_time
+            proportion = (ts.elapsed_time / ts.progress)
+            ts.remaining_time = proportion - ts.elapsed_time
         else:
             ts.remaining_time = -0.0
 
@@ -563,34 +693,32 @@ class TaskManager(TaskEventListener):
 
         return ts
 
-    def get_subtasks(self, task_id):
+    def get_subtasks(self, task_id) -> Optional[List[str]]:
         """
         Get all subtasks related to given task id
         :param task_id: Task ID
-        :return: list of all subtasks related with @task_id or None if @task_id is not known
+        :return: list of all subtasks related with @task_id or None
+                 if @task_id is not known
         """
-        if task_id not in self.tasks_states:
+        task_state = self.tasks_states.get(task_id)
+        if not task_state:
             return None
-        return [sub.subtask_id for sub in
-                list(self.tasks_states[task_id].subtask_states.values())]
+
+        subtask_states = list(task_state.subtask_states.values())
+        return [subtask_state.subtask_id for subtask_state in subtask_states]
 
     def change_config(self, root_path, use_distributed_resource_management):
         self.dir_manager = DirManager(root_path)
         self.use_distributed_resources = use_distributed_resource_management
 
-    @handle_task_key_error
-    def change_timeouts(self, task_id, full_task_timeout, subtask_timeout):
-        task = self.tasks[task_id]
-        task.header.deadline = timeout_to_deadline(full_task_timeout)
-        task.header.subtask_timeout = subtask_timeout
-        task.full_task_timeout = full_task_timeout
-        task.header.last_checking = time.time()
-
     def get_task_id(self, subtask_id):
         return self.subtask2task_mapping[subtask_id]
 
-    def get_task_dict(self, task_id):
-        task = self.tasks[task_id]
+    def get_task_dict(self, task_id) -> Optional[Dict]:
+        task = self.tasks.get(task_id)
+        if not task:  # task might have been deleted after the request was made
+            return None
+
         task_type_name = task.task_definition.task_type.lower()
         task_type = self.task_types[task_type_name]
         state = self.tasks_states.get(task.header.task_id)
@@ -608,9 +736,11 @@ class TaskManager(TaskEventListener):
                            state.to_dictionary(),
                            self.get_task_definition_dict(task))
 
-    def get_tasks_dict(self):
-        return [self.get_task_dict(task_id) for task_id
-                in self.tasks.keys()]
+    def get_tasks_dict(self) -> List[Dict]:
+        task_ids = list(self.tasks.keys())
+        mapped = map(self.get_task_dict, task_ids)
+        filtered = filter(None, mapped)
+        return list(filtered)
 
     def get_subtask_dict(self, subtask_id):
         task_id = self.subtask2task_mapping[subtask_id]
@@ -644,8 +774,10 @@ class TaskManager(TaskEventListener):
     @handle_subtask_key_error
     def set_computation_time(self, subtask_id, computation_time):
         """
-        Set computation time for subtask and also compute and set new value based on saved price for this subtask
-        :param str subtask_id: subtask which was computed in given computation_time
+        Set computation time for subtask and also compute and set new value
+        based on saved price for this subtask
+        :param str subtask_id: subtask which was computed in given
+                               computation_time
         :param float computation_time: how long does it take to compute
         this task = max timeout
 
@@ -682,31 +814,62 @@ class TaskManager(TaskEventListener):
         logger.debug('add_subtask_to_tasks_states(%r, %r, %r, %r, %r)',
                      node_name, node_id, comp_price, ctd, address)
 
-        price = self.tasks[ctd.task_id].header.max_price
+        price = self.tasks[ctd['task_id']].header.max_price
 
         ss = SubtaskState()
         ss.computer.node_id = node_id
         ss.computer.node_name = node_name
-        ss.computer.performance = ctd.performance
+        ss.computer.performance = ctd['performance']
         ss.computer.ip_address = address
         ss.computer.price = price
         ss.time_started = time.time()
-        ss.deadline = ctd.deadline
-        # TODO: read node ip address
-        ss.subtask_definition = ctd.short_description
-        ss.subtask_id = ctd.subtask_id
-        ss.extra_data = ctd.extra_data
+        ss.deadline = ctd['deadline']
+        ss.subtask_definition = ctd['short_description']
+        ss.subtask_id = ctd['subtask_id']
+        ss.extra_data = ctd['extra_data']
         ss.subtask_status = TaskStatus.starting
         ss.value = 0
 
-        self.tasks_states[ctd.task_id].subtask_states[ctd.subtask_id] = ss
+        (self.tasks_states[ctd['task_id']].
+            subtask_states[ctd['subtask_id']]) = ss
 
     def notify_update_task(self, task_id):
         self.notice_task_updated(task_id)
 
     @handle_task_key_error
-    def notice_task_updated(self, task_id):
+    def notice_task_updated(self, task_id: str, subtask_id: str = None,
+                            op: Operation = None, persist: bool = True):
+        """Called when a task is modified, saves the task and
+        propagates information
+
+        Whenever task is changed `notice_task_updated` should be called
+        to save the task - if the change is save-worthy, as specified
+        by the `persist` parameter - and propagate information about
+        changed task to other parts of the system.
+
+        Most of the calls are save-worthy, but a minority is not: for
+        instance when the work offer is received, the task does not
+        change so saving it does not make sense, but it still makes
+        sense to let other parts of the system know about the change.
+        Also, when a number of minor changes are always followed by a
+        major one, as it is with restarting a frame task, it does not
+        make sense to store all the partial changes, so only the
+        final one is considered save-worthy.
+
+        :param str task_id: id of the updated task
+        :param str subtask_id: if the operation done on the
+          task is related to a subtask, id of that subtask
+        :param Operation op: performed operation
+        :param bool persist: should the task be persisted now
+        """
         # self.save_state()
-        if self.task_persistence:
+        if persist and self.task_persistence:
             self.dump_task(task_id)
-        dispatcher.send(signal='golem.taskmanager', event='task_status_updated', task_id=task_id)
+        dispatcher.send(
+            signal='golem.taskmanager',
+            event='task_status_updated',
+            task_id=task_id,
+            task_state=self.tasks_states.get(task_id),
+            subtask_id=subtask_id,
+            op=op,
+        )

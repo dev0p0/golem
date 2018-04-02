@@ -1,26 +1,27 @@
 import logging
 
 from autobahn.twisted import ApplicationSession
-from autobahn.twisted.wamp import ApplicationRunner
 from autobahn.twisted.websocket import WampWebSocketClientFactory
 from autobahn.wamp import ProtocolError
 from autobahn.wamp import types
+from twisted.application.internet import ClientService, backoffPolicy
+from twisted.internet import ssl as twisted_ssl
+from twisted.internet._sslverify import optionsForClientTLS  # noqa # pylint: disable=protected-access
 from twisted.internet.defer import inlineCallbacks, Deferred
+from twisted.internet.endpoints import (
+    TCP4ClientEndpoint, TCP6ClientEndpoint, SSL4ClientEndpoint
+)
+
+from golem.rpc.common import X509_COMMON_NAME
 
 logger = logging.getLogger('golem.rpc')
 
 
-setProtocolOptions = WampWebSocketClientFactory.setProtocolOptions
-
-
-def set_protocol_options(instance, **options):
-    options['autoPingInterval'] = 5.
-    options['autoPingTimeout'] = 15.
-    options['openHandshakeTimeout'] = 30.
-    setProtocolOptions(instance, **options)
-
-# monkey-patch setProtocolOptions and provide custom values
-WampWebSocketClientFactory.setProtocolOptions = set_protocol_options
+OPEN_HANDSHAKE_TIMEOUT = 30.
+CLOSE_HANDSHAKE_TIMEOUT = 10.
+AUTO_PING_INTERVAL = 15.
+AUTO_PING_TIMEOUT = 12.
+BACKOFF_POLICY_FACTOR = 1.2
 
 
 class RPCAddress(object):
@@ -41,7 +42,7 @@ class RPCAddress(object):
 
 class WebSocketAddress(RPCAddress):
 
-    def __init__(self, host, port, realm, ssl=False):
+    def __init__(self, host, port, realm, ssl=True):
         self.realm = str(realm)
         self.ssl = ssl
 
@@ -51,7 +52,9 @@ class WebSocketAddress(RPCAddress):
 
 class Session(ApplicationSession):
 
-    def __init__(self, address, methods=None, events=None):
+    def __init__(self, address, methods=None, events=None,  # noqa # pylint: disable=too-many-arguments
+                 cert_manager=None, use_ipv6=False) -> None:
+
         self.address = address
         self.methods = methods or []
         self.events = events or []
@@ -60,28 +63,83 @@ class Session(ApplicationSession):
         self.ready = Deferred()
         self.connected = False
 
+        self._cert_manager = cert_manager
+
+        self._client = None
+        self._reconnect_service = None
+        self._use_ipv6 = use_ipv6
+
         self.config = types.ComponentConfig(realm=address.realm)
         super(Session, self).__init__(self.config)
 
-    def connect(self, ssl=None, proxy=None, headers=None, auto_reconnect=True,
-                log_level='info'):
+    def connect(self, auto_reconnect=True):
 
-        runner = ApplicationRunner(
-            url=str(self.address),
-            realm=self.address.realm,
-            ssl=ssl,
-            proxy=proxy,
-            headers=headers
+        def init(proto):
+            reactor.addSystemEventTrigger('before', 'shutdown', cleanup, proto)
+            return proto
+
+        def cleanup(proto):
+            session = getattr(proto, '_session', None)
+            if session is None:
+                return
+            if session.is_attached():
+                return session.leave()
+            elif session.is_connected():
+                return session.disconnect()
+
+        from twisted.internet import reactor
+
+        transport_factory = WampWebSocketClientFactory(self, str(self.address))
+        transport_factory.setProtocolOptions(
+            maxFramePayloadSize=1048576,
+            maxMessagePayloadSize=1048576,
+            autoFragmentSize=65536,
+            failByDrop=False,
+            openHandshakeTimeout=OPEN_HANDSHAKE_TIMEOUT,
+            closeHandshakeTimeout=CLOSE_HANDSHAKE_TIMEOUT,
+            tcpNoDelay=True,
+            autoPingInterval=AUTO_PING_INTERVAL,
+            autoPingTimeout=AUTO_PING_TIMEOUT,
+            autoPingSize=4,
         )
 
-        deferred = runner.run(
-            make=self,
-            start_reactor=False,
-            auto_reconnect=auto_reconnect,
-            log_level=log_level
-        )
+        if self.address.ssl:
+            if self._cert_manager:
+                cert_data = self._cert_manager.read_certificate()
+                authority = twisted_ssl.Certificate.loadPEM(cert_data)
+            else:
+                authority = None
 
+            context_factory = optionsForClientTLS(X509_COMMON_NAME,
+                                                  trustRoot=authority)
+            self._client = SSL4ClientEndpoint(reactor,
+                                              self.address.host,
+                                              self.address.port,
+                                              context_factory)
+        else:
+            if self._use_ipv6:
+                endpoint_cls = TCP6ClientEndpoint
+            else:
+                endpoint_cls = TCP4ClientEndpoint
+
+            self._client = endpoint_cls(reactor,
+                                        self.address.host,
+                                        self.address.port)
+
+        if auto_reconnect:
+            self._reconnect_service = ClientService(
+                endpoint=self._client,
+                factory=transport_factory,
+                retryPolicy=backoffPolicy(factor=BACKOFF_POLICY_FACTOR)
+            )
+            self._reconnect_service.startService()
+            deferred = self._reconnect_service.whenConnected()
+        else:
+            deferred = self._client.connect(transport_factory)
+
+        deferred.addCallback(init)
         deferred.addErrback(self.ready.errback)
+
         return self.ready
 
     @inlineCallbacks
@@ -101,6 +159,11 @@ class Session(ApplicationSession):
     def onDisconnect(self):
         self.connected = False
         super(Session, self).onDisconnect()
+
+    @inlineCallbacks
+    def add_methods(self, methods):
+        self.methods += methods
+        yield self.register_methods(methods)
 
     @inlineCallbacks
     def register_methods(self, methods):
@@ -134,6 +197,7 @@ class Session(ApplicationSession):
     @staticmethod
     def _on_error(err):
         logger.error("RPC: Session error: {}".format(err))
+        return err
 
 
 class Client(object):

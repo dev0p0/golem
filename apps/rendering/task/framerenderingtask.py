@@ -1,5 +1,3 @@
-
-
 import logging
 import math
 import os
@@ -14,10 +12,11 @@ from apps.core.task.coretaskstate import Options
 from apps.rendering.resources.imgrepr import load_as_pil
 from apps.rendering.resources.renderingtaskcollector import \
     RenderingTaskCollector
+from apps.rendering.resources.utils import handle_image_error, handle_none
 from apps.rendering.task.renderingtask import (RenderingTask,
                                                RenderingTaskBuilder,
                                                PREVIEW_EXT)
-from apps.rendering.task.verificator import FrameRenderingVerificator
+from apps.rendering.task.verifier import FrameRenderingVerifier
 from golem.core.common import update_dict, to_unicode
 from golem.task.taskbase import ResultType
 from golem.task.taskstate import SubtaskStatus, TaskStatus, SubtaskState
@@ -48,7 +47,7 @@ class FrameState(object):
 
 class FrameRenderingTask(RenderingTask):
 
-    VERIFICATOR_CLASS = FrameRenderingVerificator
+    VERIFIER_CLASS = FrameRenderingVerifier
 
     ################
     # Task methods #
@@ -78,9 +77,6 @@ class FrameRenderingTask(RenderingTask):
             self.preview_task_file_path = [None] * len(self.frames)
         self.last_preview_path = None
 
-        self.verificator.use_frames = self.use_frames
-        self.verificator.frames = self.frames
-
     @CoreTask.handle_key_error
     def computation_failed(self, subtask_id):
         CoreTask.computation_failed(self, subtask_id)
@@ -91,10 +87,18 @@ class FrameRenderingTask(RenderingTask):
             self._update_task_preview()
 
     @CoreTask.handle_key_error
-    def computation_finished(self, subtask_id, task_result, result_type=ResultType.DATA):
-        super(FrameRenderingTask, self).computation_finished(subtask_id,
-                                                             task_result,
-                                                             result_type)
+    def computation_finished(self, subtask_id, task_result,
+                             result_type=ResultType.DATA,
+                             verification_finished_=None):
+        super(FrameRenderingTask, self).computation_finished(
+            subtask_id,
+            task_result,
+            result_type,
+            verification_finished_)
+
+    def verification_finished(self, subtask_id, verdict, result):
+        super(FrameRenderingTask, self).verification_finished(subtask_id,
+                                                              verdict, result)
         if self.use_frames:
             self._update_subtask_frame_status(subtask_id)
 
@@ -120,6 +124,7 @@ class FrameRenderingTask(RenderingTask):
     def get_subtasks(self, frame):
         if self.task_definition.options.use_frames:
             subtask_ids = self.frames_subtasks.get(to_unicode(frame), [])
+            subtask_ids = filter(None, subtask_ids)
         else:
             subtask_ids = self.subtasks_given.keys()
 
@@ -188,20 +193,29 @@ class FrameRenderingTask(RenderingTask):
     def _update_frame_preview(self, new_chunk_file_path, frame_num, part=1, final=False):
         num = self.frames.index(frame_num)
         preview_task_file_path = self._get_preview_task_file_path(num)
-        img = load_as_pil(new_chunk_file_path)
 
-        if not final:
-            img = self._paste_new_chunk(img, self._get_preview_file_path(num), part,
-                                        int(self.total_tasks / len(self.frames)))
+        with handle_image_error(logger), \
+                handle_none(load_as_pil(new_chunk_file_path),
+                            raise_if_none=IOError("load_as_pil failed")) as img:
 
-        img_x, img_y = img.size
-        img = img.resize((int(round(self.scale_factor * img_x)),
-                          int(round(self.scale_factor * img_y))),
-                         resample=Image.BILINEAR)
-        img.save(self._get_preview_file_path(num), PREVIEW_EXT)
-        img.save(preview_task_file_path, PREVIEW_EXT)
+            def resize_and_save(img):
+                img_x, img_y = img.size
+                with img.resize((int(round(self.scale_factor * img_x)),
+                                 int(round(self.scale_factor * img_y))),
+                                resample=Image.BILINEAR) as img_resized:
+                    img_resized.save(self._get_preview_file_path(num),
+                                     PREVIEW_EXT)
+                    img_resized.save(preview_task_file_path, PREVIEW_EXT)
 
-        img.close()
+            if not final:
+                with self._paste_new_chunk(
+                    img, self._get_preview_file_path(num), part,
+                    int(self.total_tasks / len(self.frames))
+                ) as img_pasted:
+                    resize_and_save(img_pasted)
+            else:
+                resize_and_save(img)
+
         self.last_preview_path = preview_task_file_path
 
     @CoreTask.handle_key_error
@@ -248,16 +262,20 @@ class FrameRenderingTask(RenderingTask):
             img_offset.paste(img_chunk, (0, offset))
         except Exception as err:
             logger.error("Can't generate preview {}".format(err))
+            img_offset.close()
             img_offset = None
 
         if not os.path.exists(preview_file_path):
             return img_offset
 
         try:
-            img = Image.open(preview_file_path)
             if img_offset:
-                img = ImageChops.add(img, img_offset)
-            return img
+                with Image.open(preview_file_path) as img:
+                    result = ImageChops.add(img, img_offset)
+                    img_offset.close()
+                    return result
+            else:
+                return Image.open(preview_file_path)
         except Exception as err:
             logger.error("Can't add new chunk to preview{}".format(err))
             return img_offset
@@ -266,8 +284,8 @@ class FrameRenderingTask(RenderingTask):
         sent_color = (0, 255, 0)
         failed_color = (255, 0, 0)
 
-        for sub in self.subtasks_given.values():
-            if SubtaskStatus.is_computed(sub['status']):
+        for sub in list(self.subtasks_given.values()):
+            if SubtaskStatus.is_active(sub['status']):
                 for frame in sub['frames']:
                     self.__mark_sub_frame(sub, frame, sent_color)
 
@@ -278,9 +296,12 @@ class FrameRenderingTask(RenderingTask):
     def _open_frame_preview(self, preview_file_path):
 
         if not os.path.exists(preview_file_path):
-            img = Image.new("RGB", (int(round(self.res_x * self.scale_factor)), 
-                                    int(round(self.res_y * self.scale_factor))))
-            img.save(preview_file_path, PREVIEW_EXT)
+            with handle_image_error(logger), \
+                    Image.new("RGB",
+                              (int(round(self.res_x * self.scale_factor)),
+                               int(round(self.res_y * self.scale_factor)))) \
+                    as img:
+                img.save(preview_file_path, PREVIEW_EXT)
 
         return Image.open(preview_file_path)
 
@@ -321,7 +342,9 @@ class FrameRenderingTask(RenderingTask):
             collector = RenderingTaskCollector(paste=True, width=self.res_x, height=self.res_y)
             for file in self.collected_file_names.values():
                 collector.add_img_file(file)
-            collector.finalize().save(output_file_name, self.output_format)
+            with handle_image_error(logger), \
+                    collector.finalize() as image:
+                image.save(output_file_name, self.output_format)
         else:
             self._put_collected_files_together(os.path.join(self.tmp_dir, output_file_name),
                                                list(self.collected_file_names.values()), "paste")
@@ -336,7 +359,9 @@ class FrameRenderingTask(RenderingTask):
             collector = RenderingTaskCollector(paste=True, width=self.res_x, height=self.res_y)
             for file in collected.values():
                 collector.add_img_file(file)
-            collector.finalize().save(output_file_name, self.output_format)
+            with handle_image_error(logger), \
+                    collector.finalize() as image:
+                image.save(output_file_name, self.output_format)
         else:
             self._put_collected_files_together(output_file_name, list(collected.values()), "paste")
 
@@ -376,9 +401,9 @@ class FrameRenderingTask(RenderingTask):
     def __mark_sub_frame(self, sub, frame, color):
         idx = self.frames.index(frame)
         preview_task_file_path = self._get_preview_task_file_path(idx)
-        img_task = self._open_frame_preview(preview_task_file_path)
-        self._mark_task_area(sub, img_task, color, idx)
-        img_task.save(preview_task_file_path, PREVIEW_EXT)
+        with self._open_frame_preview(preview_task_file_path) as img_task:
+            self._mark_task_area(sub, img_task, color, idx)
+            img_task.save(preview_task_file_path, PREVIEW_EXT)
 
     def _get_subtask_file_path(self, subtask_dir_list, name_dir, num):
         if subtask_dir_list[num] is None:

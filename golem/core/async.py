@@ -1,7 +1,52 @@
+import functools
 import logging
-from twisted.internet import threads
+from typing import Callable, Optional
 
-log = logging.getLogger(__name__)
+from twisted.internet import defer
+from twisted.internet import threads
+from twisted.web.iweb import IBodyProducer
+from zope.interface import implementer
+
+logger = logging.getLogger(__name__)
+
+
+class AsyncHTTPRequest:
+
+    agent = None
+    timeout = 5
+
+    @implementer(IBodyProducer)
+    class BytesBodyProducer:
+
+        def __init__(self, body):
+            self.body = body
+            self.length = len(body)
+
+        def startProducing(self, consumer):
+            consumer.write(self.body)
+            return defer.succeed(None)
+
+        def pauseProducing(self):
+            pass
+
+        def resumeProducing(self):
+            pass
+
+        def stopProducing(self):
+            pass
+
+    @classmethod
+    def run(cls, method, uri, headers, body):
+        if not cls.agent:
+            cls.agent = cls.create_agent()
+        return cls.agent.request(method, uri, headers,
+                                 cls.BytesBodyProducer(body))
+
+    @classmethod
+    def create_agent(cls):
+        from twisted.internet import reactor
+        from twisted.web.client import Agent  # imports reactor
+        return Agent(reactor, connectTimeout=cls.timeout)
 
 
 class AsyncRequest(object):
@@ -14,7 +59,8 @@ class AsyncRequest(object):
         self.kwargs = kwargs or {}
 
 
-def async_run(deferred_call, success=None, error=None):
+def async_run(deferred_call: AsyncRequest, success: Optional[Callable] = None,
+              error: Optional[Callable] = None):
     """Execute a deferred job in a separate thread (Twisted)"""
     deferred = threads.deferToThread(deferred_call.method,
                                      *deferred_call.args,
@@ -26,12 +72,28 @@ def async_run(deferred_call, success=None, error=None):
     deferred.addErrback(error)
     return deferred
 
-  
-def async_callback(func):
-    def callback(result):
-        return async_run(AsyncRequest(func, result))
-    return callback
-
 
 def default_errback(failure):
-    log.error('Caught async exception:\n%s', failure.getTraceback())
+    logger.error('Caught async exception:\n%s', failure.getTraceback())
+    return failure  # return the failure to continue with the errback chain
+
+
+def deferred_run():
+    def wrapped(f):
+        @functools.wraps(f)
+        def curry(*args, **kwargs):
+            # Import reactor only when it is necessary;
+            # otherwise process-wide signal handlers may be installed
+            from twisted.internet import reactor
+            if reactor.running:
+                execute = threads.deferToThread
+            else:
+                logger.debug(
+                    'Reactor not running.'
+                    ' Switching to blocking call for %r',
+                    f,
+                )
+                execute = defer.execute
+            return execute(f, *args, **kwargs)
+        return curry
+    return wrapped

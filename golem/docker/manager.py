@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from threading import Thread
 
 from golem.core.common import is_linux, is_windows, is_osx, get_golem_path, \
-    DEVNULL, to_unicode
+    DEVNULL, to_unicode, SUBPROCESS_STARTUP_INFO
 from golem.core.threads import ThreadQueueExecutor
 from golem.docker.config_manager import DockerConfigManager
 from golem.report import report_calls, Component
@@ -31,14 +31,14 @@ class DockerManager(DockerConfigManager):
     docker_machine_commands = dict(
         create=['docker-machine', 'create'],
         rm=['docker-machine', 'rm', '-y'],
-        start=['docker-machine', 'start'],
+        start=['docker-machine', 'restart'],
         stop=['docker-machine', 'stop'],
         active=['docker-machine', 'active'],
         list=['docker-machine', 'ls', '-q'],
         env=['docker-machine', 'env'],
         status=['docker-machine', 'status'],
         inspect=['docker-machine', 'inspect'],
-        regenerate_certs=['docker-machine', 'regenerate-certs']
+        regenerate_certs=['docker-machine', 'regenerate-certs', '--force']
     )
 
     docker_commands = dict(
@@ -84,6 +84,7 @@ class DockerManager(DockerConfigManager):
             return XhyveHypervisor.instance(self)
         return None
 
+    @report_calls(Component.docker, 'instance.check')
     def check_environment(self):
 
         if is_windows():
@@ -169,7 +170,8 @@ class DockerManager(DockerConfigManager):
             cpu_count = max(int(config_desc.num_cores), cpu_count)
 
         with self._try():
-            memory_size += int(config_desc.max_memory_size) // 1000
+            memory_size = max(int(config_desc.max_memory_size) // 1024,
+                              memory_size)
 
         with self._try():
             if config_desc.docker_machine_name:
@@ -242,6 +244,7 @@ class DockerManager(DockerConfigManager):
             return [i.strip() for i in output.split("\n") if i]
         return []
 
+    @report_calls(Component.docker, 'instance.check')
     def docker_machine_running(self, name=None):
         if not self.docker_machine:
             raise EnvironmentError("No Docker VM available")
@@ -250,36 +253,38 @@ class DockerManager(DockerConfigManager):
             status = self.command('status', name or self.docker_machine)
             status = status.strip().replace("\n", "")
             return status == 'Running'
-        except Exception as e:
-            logger.error("DockerMachine: failed to check docker-machine status: {}"
-                         .format(e))
+        except subprocess.CalledProcessError as e:
+            logger.error("DockerMachine: failed to check status: %s", e)
+            logger.debug("DockerMachine_output: %s", e.output)
         return False
 
+    @report_calls(Component.docker, 'instance.start')
     def start_docker_machine(self, name=None):
         name = name or self.docker_machine
         logger.info("DockerMachine: starting {}".format(name))
 
         try:
-            self.command('start', name, check_output=False)
-        except Exception as e:
-            logger.error("DockerMachine: failed to start the VM: {}"
-                         .format(e))
+            self.command('start', name)
+        except subprocess.CalledProcessError as e:
+            logger.error("DockerMachine: failed to start the VM: %s", e)
+            logger.debug("DockerMachine_output: %s", e.output)
+            raise
 
+    @report_calls(Component.docker, 'instance.stop')
     def stop_docker_machine(self, name=None):
         name = name or self.docker_machine
         logger.info("DockerMachine: stopping '{}'".format(name))
 
         try:
-            self.command('stop', name, check_output=False)
+            self.command('stop', name)
             return True
-        except Exception as e:
-            logger.warn("DockerMachine: failed to stop the VM: {}"
-                        .format(e))
+        except subprocess.CalledProcessError as e:
+            logger.warning("DockerMachine: failed to stop the VM: %s", e)
+            logger.debug("DockerMachine_output: %s", e.output)
         return False
 
     @classmethod
-    def command(cls, key, machine_name=None, args=None,
-                check_output=True, shell=False):
+    def command(cls, key, machine_name=None, args=None, shell=False):
 
         command = cls.docker_machine_commands.get(key)
         if not command:
@@ -296,13 +301,11 @@ class DockerManager(DockerConfigManager):
         logger.debug('docker_machine_command: %s', command)
         params = dict(shell=shell, stdin=DEVNULL)
 
-        if check_output:
-            output = subprocess.check_output(command, stderr=subprocess.PIPE,
-                                             **params)
-            return to_unicode(output)
-
-        return subprocess.check_call(command, stdout=DEVNULL, stderr=DEVNULL,
-                                     **params)
+        output = subprocess.check_output(command, stderr=subprocess.STDOUT,
+                                         startupinfo=SUBPROCESS_STARTUP_INFO,
+                                         **params)
+        logger.debug('docker_machine_command_output: %s', output)
+        return to_unicode(output)
 
     @property
     def config_dir(self):
@@ -314,7 +317,7 @@ class DockerManager(DockerConfigManager):
 
         for entry in cls._collect_images():
             version = cls._image_version(entry)
-            if not cls.command('images', args=[version], check_output=True):
+            if not cls.command('images', args=[version]):
                 entries.append(entry)
 
         if entries:
@@ -326,7 +329,7 @@ class DockerManager(DockerConfigManager):
         cwd = os.getcwd()
 
         for entry in entries:
-            image, docker_file, tag = entry
+            image, docker_file, tag, build_dir = entry
             version = cls._image_version(entry)
 
             try:
@@ -335,7 +338,7 @@ class DockerManager(DockerConfigManager):
                             .format(version))
                 cls.command('build', args=['-t', image,
                                            '-f', docker_file,
-                                           '.'])
+                                           build_dir])
                 cls.command('tag', args=[image, version])
             finally:
                 os.chdir(cwd)
@@ -346,25 +349,27 @@ class DockerManager(DockerConfigManager):
 
         for entry in cls._collect_images():
             version = cls._image_version(entry)
-            if not cls.command('images', args=[version], check_output=True):
+            if not cls.command('images', args=[version]):
                 entries.append(entry)
 
         if entries:
             cls._pull_images(entries)
 
     @classmethod
-    @report_calls(Component.docker, 'images.pull')
     def _pull_images(cls, entries):
         for entry in entries:
             version = cls._image_version(entry)
+            cls._pull_image(version)
 
-            logger.warn('Docker: pulling image {}'
-                        .format(version))
-            cls.command('pull', args=[version])
+    @classmethod
+    @report_calls(Component.docker, 'images.pull')
+    def _pull_image(cls, version):
+        logger.warning('Docker: pulling image %r', version)
+        cls.command('pull', args=[version])
 
     @classmethod
     def _image_version(cls, entry):
-        image, _, tag = entry
+        image, _, tag, _ = entry
         return '{}:{}'.format(image, tag)
 
     @classmethod
@@ -401,21 +406,64 @@ class DockerManager(DockerConfigManager):
         self._set_docker_machine_env()
         cb()
 
+    @report_calls(Component.docker, 'instance.env')
     def _set_docker_machine_env(self, retried=False):
         try:
             output = self.command('env', self.docker_machine,
                                   args=('--shell', 'cmd'))
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as e:
+            logger.warning("DockerMachine: failed to env the VM: %s", e)
+            logger.debug("DockerMachine_output: %s", e.output)
             if not retried:
-                self.command('regenerate_certs', self.docker_machine)
-                return self._set_docker_machine_env(retried=True)
+                return self._recover_docker_machine_env()
+            typical_solution_s = """It seems there is a  problem with your Docker installation.
+Ensure that you try the following before reporting an issue:
+
+ 1. The virtualization of Intel VT-x/EPT or AMD-V/RVI is enabled in BIOS
+    or virtual machine settings.
+ 2. The proper environment is set. On windows powershell please run:
+    & "C:\Program Files\Docker Toolbox\docker-machine.exe" env golem | Invoke-Expression
+ 3. virtualbox driver is available:
+    docker-machine.exe create --driver virtualbox golem
+ 4. Restart Windows machine"""
+            logger.error(typical_solution_s)
             raise
 
         if output:
             self._set_env_from_output(output)
             logger.info('DockerMachine: env updated')
         else:
-            logger.warn('DockerMachine: env update failed')
+            logger.warning('DockerMachine: env update failed')
+
+    def _recover_docker_machine_env(self):
+        try:
+            self.command('regenerate_certs', self.docker_machine)
+        except subprocess.CalledProcessError as e:
+            logger.warning("DockerMachine:"
+                           " failed to env the VM: %s -- %s",
+                           e, e.output)
+        else:
+            return self._set_docker_machine_env(retried=True)
+
+        try:
+            self.command('start', self.docker_machine)
+        except subprocess.CalledProcessError as e:
+            logger.warning("DockerMachine:"
+                           " failed to restart the VM: %s -- %s",
+                           e, e.output)
+        else:
+            return self._set_docker_machine_env(retried=True)
+
+        try:
+            if self.hypervisor:
+                if self.hypervisor.remove(self.docker_machine):
+                    self.hypervisor.create(self.docker_machine)
+        except subprocess.CalledProcessError as e:
+            logger.warning("DockerMachine:"
+                           " failed to re-create the VM: %s -- %s",
+                           e, e.output)
+
+        return self._set_docker_machine_env(retried=True)
 
     def _set_env_from_output(self, output):
         for line in output.split('\n'):
@@ -458,15 +506,14 @@ class Hypervisor(object):
         raise NotImplementedError
 
     def remove(self, name):
-        logger.info("Hypervisor: removing VM '{}'".format(name))
+        logger.info("Hypervisor: removing VM '%s'", name)
         try:
-            self._docker_manager.command('rm', name,
-                                         check_output=False)
+            self._docker_manager.command('rm', name)
             return True
-        except Exception as e:
-            logger.warn("Hypervisor: error removing VM '{}': {}"
-                        .format(name, e))
-            return False
+        except subprocess.CalledProcessError as e:
+            logger.warning("Hypervisor: error removing VM '%s': %s", name, e)
+            logger.debug("Hypervisor_output: %s", e.output)
+        return False
 
     def constrain(self, name, **params):
         raise NotImplementedError
@@ -574,13 +621,12 @@ class VirtualBoxHypervisor(Hypervisor):
 
         try:
             self._docker_manager.command('create', name,
-                                         args=('--driver', 'virtualbox'),
-                                         check_output=False)
+                                         args=('--driver', 'virtualbox'))
             return True
-        except Exception as e:
-            logger.error("VirtualBox: error creating VM '{}': {}"
-                         .format(name, e))
-            return False
+        except subprocess.CalledProcessError as e:
+            logger.error("VirtualBox: error creating VM '%s': %s", name, e)
+            logger.debug("Hypervisor_output: %s", e.output)
+        return False
 
     def constraints(self, name):
         result = {}
@@ -728,8 +774,7 @@ class XhyveHypervisor(Hypervisor):
 
         try:
             self._docker_manager.command('create', name,
-                                         args=args,
-                                         check_output=False)
+                                         args=args)
             return True
         except Exception as e:
             logger.error("Xhyve: error creating VM '{}': {}"
@@ -795,7 +840,8 @@ class XhyveHypervisor(Hypervisor):
         return config
 
     def _config(self, name):
-        config_path = os.path.join(self._docker_manager.config_dir, name, 'config.json')
+        config_path = os.path.join(self._docker_manager.config_dir, name,
+                                   'config.json')
         config = None
 
         try:

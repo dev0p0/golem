@@ -1,17 +1,18 @@
+import json
+from os import makedirs, path
 import shutil
 import time
-from os import makedirs, path
+from unittest import mock
+from unittest.mock import Mock
 
-import json
 import pytest
-from mock import Mock
 
 from apps.blender.task.blenderrendertask import BlenderRenderTaskBuilder, BlenderRenderTask
 from golem.clientconfigdescriptor import ClientConfigDescriptor
 from golem.core.common import get_golem_path, timeout_to_deadline
 from golem.core.simpleserializer import DictSerializer
 from golem.docker.image import DockerImage
-from golem.node import OptNode
+from golem.node import Node
 from golem.resource.dirmanager import DirManager
 from golem.task.localcomputer import LocalComputer
 from golem.task.taskbase import ResultType, TaskHeader
@@ -67,6 +68,7 @@ class TestDockerBlenderTask(TempDirFixture, DockerTestCase):
         return task_def
 
     def _create_test_task(self, task_file=CYCLES_TASK_FILE):
+        BlenderRenderTask.VERIFICATION_QUEUE._reset()
         task_def = self._load_test_task_definition(task_file)
         node_name = "0123456789abcdef"
         dir_manager = DirManager(self.path)
@@ -75,23 +77,37 @@ class TestDockerBlenderTask(TempDirFixture, DockerTestCase):
         render_task.__class__._update_task_preview = lambda self_: ()
         return render_task
 
-    def _run_docker_task(self, render_task, timeout=60*5):
+    def _run_docker_task(self, render_task, timeout=60):
         task_id = render_task.header.task_id
         extra_data = render_task.query_extra_data(1.0)
         ctd = extra_data.ctd
-        ctd.deadline = timeout_to_deadline(timeout)
+        ctd['deadline'] = timeout_to_deadline(timeout)
 
         # Create the computing node
-        self.node = OptNode(datadir=self.path, use_docker_machine_manager=False)
-        self.node.client.ranking = Mock()
+        self.node = Node(
+            datadir=self.path,
+            app_config=Mock(),
+            config_desc=ClientConfigDescriptor(),
+            use_docker_manager=False,
+        )
+        with mock.patch('golem.client.EthereumTransactionSystem'):
+            self.node.client = self.node._client_factory(Mock())
         self.node.client.start = Mock()
-        self.node.client.p2pservice = Mock()
         self.node._run()
 
         ccd = ClientConfigDescriptor()
 
-        task_server = TaskServer(Mock(), ccd, Mock(), self.node.client,
-                                 use_docker_machine_manager=False)
+        with mock.patch(
+                "golem.network.concent.handlers_library"
+                ".HandlersLibrary"
+                ".register_handler"):
+            task_server = TaskServer(
+                node=Mock(),
+                config_desc=ccd,
+                client=self.node.client,
+                use_docker_manager=False,
+            )
+        task_server.create_and_set_result_package = Mock()
         task_server.task_keeper.task_headers[task_id] = render_task.header
         task_computer = task_server.task_computer
 
@@ -120,7 +136,7 @@ class TestDockerBlenderTask(TempDirFixture, DockerTestCase):
 
         # Start task computation
         task_computer.task_given(ctd)
-        result = task_computer.resource_given(ctd.task_id)
+        result = task_computer.resource_given(ctd['task_id'])
         assert result
 
         # Thread for task computation should be created by now
@@ -130,7 +146,7 @@ class TestDockerBlenderTask(TempDirFixture, DockerTestCase):
         if task_thread:
             started = time.time()
             while task_thread.is_alive():
-                if time.time() - started >= 60:
+                if time.time() - started >= timeout:
                     task_thread.end_comp()
                     break
                 time.sleep(1)
@@ -154,8 +170,10 @@ class TestDockerBlenderTask(TempDirFixture, DockerTestCase):
     def _run_docker_local_comp_task(self, render_task, timeout=60*5):
         render_task.deadline = timeout_to_deadline(timeout)
         local_computer = LocalComputer(
-            render_task, self.tempdir, Mock(), Mock(),
-            render_task.query_extra_data_for_test_task)
+            root_path=self.tempdir, success_callback=Mock(),
+            error_callback=Mock(),
+            get_compute_task_def=render_task.query_extra_data_for_test_task,
+            resources=render_task.task_resources)
         local_computer.run()
         local_computer.tt.join(60)
         return local_computer.tt
@@ -198,7 +216,7 @@ class TestDockerBlenderTask(TempDirFixture, DockerTestCase):
         assert isinstance(task, BlenderRenderTask)
         assert not task.compositing
         assert not task.use_frames
-        assert len(task.frames_given) == 10
+        assert len(task.frames_given) == 5
         assert isinstance(task.preview_file_path, str)
         assert not task.preview_updaters
         assert task.scale_factor == 0.8
@@ -214,8 +232,8 @@ class TestDockerBlenderTask(TempDirFixture, DockerTestCase):
         assert task.header.resource_size > 0
         assert task.header.environment == 'BLENDER'
         assert task.header.estimated_memory == 0
-        assert task.header.docker_images[0].repository == 'golemfactory/blender'
-        assert task.header.docker_images[0].tag == '1.3'
+        assert task.docker_images[0].repository == 'golemfactory/blender'
+        assert task.docker_images[0].tag == '1.4'
         assert task.header.max_price == 10.2
         assert not task.header.signature
         assert task.listeners == []
@@ -234,7 +252,6 @@ class TestDockerBlenderTask(TempDirFixture, DockerTestCase):
         assert task.results == {}
         assert task.res_files == {}
         assert path.isdir(task.tmp_dir)
-        assert task.verificator.verification_options is None
 
     @pytest.mark.slow
     def test_blender_render_subtask(self):
@@ -254,7 +271,7 @@ class TestDockerBlenderTask(TempDirFixture, DockerTestCase):
 
     def test_wrong_image_repository_specified(self):
         task = self._create_test_task()
-        task.header.docker_images = [DockerImage("%$#@!!!")]
+        task.docker_images = [DockerImage("%$#@!!!")]
         task_thread, error_msg, out_dir = self._run_docker_task(task)
         if task_thread:
             assert not task_thread.result
@@ -262,8 +279,8 @@ class TestDockerBlenderTask(TempDirFixture, DockerTestCase):
 
     def test_wrong_image_id_specified(self):
         task = self._create_test_task()
-        image = task.header.docker_images[0]
-        task.header.docker_images = [
+        image = task.docker_images[0]
+        task.docker_images = [
             DockerImage(image.repository, image_id="%$#@!!!")]
         task_thread, error_msg, out_dir = self._run_docker_task(task)
         if task_thread:
@@ -282,6 +299,20 @@ class TestDockerBlenderTask(TempDirFixture, DockerTestCase):
         assert isinstance(task_thread, DockerTaskThread)
         assert isinstance(error_msg, str)
         assert error_msg.startswith("Subtask computation failed")
+
+    def test_subtask_killed(self):
+        task = self._create_test_task()
+        # Replace the main script source with another script that will
+        # kill itself
+        task.src_code = \
+            'import os; import signal; os.kill(os.getpid(), signal.SIGKILL)'
+        task.main_program_file = path.join(
+            path.join(get_golem_path(), "golem"), "node.py")
+        task.task_resources = {task.main_program_file, task.main_scene_file}
+        task_thread, error_msg, out_dir = self._run_docker_task(task)
+        assert isinstance(task_thread, DockerTaskThread)
+        assert isinstance(error_msg, str)
+        assert "out-of-memory" in error_msg
 
     def test_blender_scene_file_error(self):
         task = self._create_test_task()

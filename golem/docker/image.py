@@ -1,4 +1,5 @@
 import logging
+import requests.exceptions
 
 from docker.errors import NotFound, APIError
 
@@ -19,7 +20,15 @@ class DockerImage(object):
         return docker_image.name == self.name and docker_image.tag == self.tag
 
     def __repr__(self):
-        return "DockerImage(repository=%r, image_id=%r, tag=%r)" % (self.repository, self.id, self.tag)
+        return ("DockerImage(repository={repository},"
+                " image_id={id}, tag={tag})").format(**self.__dict__)
+
+    def to_dict(self):
+        return {
+            'repository': self.repository,
+            'image_id': self.id,
+            'tag': self.tag,
+        }
 
     def is_available(self):
         client = local_client()
@@ -27,9 +36,8 @@ class DockerImage(object):
             if self.id:
                 info = client.inspect_image(self.id)
                 return self.name in info["RepoTags"]
-            else:
-                info = client.inspect_image(self.name)
-                return self.id is None or info["Id"] == self.id
+            info = client.inspect_image(self.name)
+            return self.id is None or info["Id"] == self.id
         except NotFound:
             log.debug('DockerImage NotFound', exc_info=True)
             return False
@@ -40,4 +48,7 @@ class DockerImage(object):
             raise
         except ValueError:
             log.debug('DockerImage ValueError', exc_info=True)
+            return False
+        except requests.exceptions.ConnectionError:
+            log.debug("DockerImage Can't connect", exc_info=True)
             return False

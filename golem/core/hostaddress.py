@@ -1,12 +1,13 @@
+import ipaddress
 import logging
-import netifaces
-
 import os
 import socket
+from collections import Iterable
+from typing import Union, List
 
-import ipaddress
+import netifaces
+
 from golem.network.stun import pystun as stun
-
 from .variables import DEFAULT_CONNECT_TO, DEFAULT_CONNECT_TO_PORT
 
 logger = logging.getLogger(__name__)
@@ -16,11 +17,11 @@ logger = logging.getLogger(__name__)
 #   return [i[4][0] for i in socket.getaddrinfo(socket.gethostname(), 0, socket.AF_INET)]
 
 
-def ip_addresses(use_ipv6=False):
+def ip_addresses(use_ipv6: bool = False) -> List[str]:
     """ Return list of internet addresses that this host have
-    :param bool use_ipv6: *Default: False* if True it returns this host IPv6 addresses, otherwise IPv4 addresses are
-     returned
-     :return list: list of host addresses
+    :param bool use_ipv6: *Default: False* if True it returns this host IPv6
+    addresses, otherwise IPv4 addresses are returned
+    :return list: list of host addresses
     """
     if use_ipv6:
         addr_family = netifaces.AF_INET6
@@ -29,14 +30,21 @@ def ip_addresses(use_ipv6=False):
     addresses = []
     for inter in netifaces.interfaces():
         ip = netifaces.ifaddresses(inter).get(addr_family)
-        if ip is None:
+        if not isinstance(ip, Iterable):
             continue
         for addrInfo in ip:
             addr = addrInfo.get('addr')
-            if addr is not None:
-                addresses.append(addr.split("%")[0])
-            if '127.0.0.1' in addresses:
-                addresses.remove('127.0.0.1')
+
+            try:
+                ip_addr = ipaddress.ip_address(addr)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error("Error parsing ip address %r: %r", addr, exc)
+                continue
+
+            if not is_ip_address_allowed(ip_addr):
+                continue
+            addresses.append(str(ip_addr))
+
     return addresses
 
 
@@ -46,26 +54,45 @@ def ipv4_networks():
 
     for inter in netifaces.interfaces():
         ip = netifaces.ifaddresses(inter).get(addr_family)
-        if not ip:
+        if not isinstance(ip, Iterable):
             continue
         for addrInfo in ip:
-            addr = str(addrInfo.get('addr'))
-            mask = str(addrInfo.get('netmask', '255.255.255.0'))
+            addr = addrInfo.get('addr')
+            mask = addrInfo.get('netmask', '255.255.255.0')
 
             try:
-                ip_addr = ipaddress.ip_network((addr, mask), strict=False)
+                ip_net = ipaddress.ip_network((addr, mask), strict=False)
             except Exception as exc:
-                logger.error("Error parsing ip address {}: {}".format(addr, exc))
+                logger.error("Error parsing ip address %r: %r", addr, exc)
                 continue
 
-            if addr != '127.0.0.1':
-                split = str(ip_addr).split('/')
-                addresses.append((split[0], split[1]))
+            if not is_ip_network_allowed(ip_net):
+                continue
+            split = str(ip_net).split('/')
+            addresses.append((split[0], split[1]))
+
     return addresses
 
 
-ip4Addresses = ip_addresses
 get_host_addresses = ip_addresses
+
+
+def is_ip_address_allowed(ip_addr: Union[ipaddress.IPv4Address,
+                                         ipaddress.IPv6Address]) -> bool:
+    return not (ip_addr.is_loopback or
+                ip_addr.is_link_local or
+                ip_addr.is_multicast or
+                ip_addr.is_unspecified or
+                ip_addr.is_reserved)
+
+
+def is_ip_network_allowed(ip_net: Union[ipaddress.IPv4Network,
+                                        ipaddress.IPv6Network]) -> bool:
+    return not (ip_net.is_loopback or
+                ip_net.is_link_local or
+                ip_net.is_multicast or
+                ip_net.is_unspecified or
+                ip_net.is_reserved)
 
 
 def ip_address_private(address):
@@ -106,16 +133,16 @@ def get_host_address_from_connection(connect_to=DEFAULT_CONNECT_TO, connect_to_p
 
 
 def get_external_address(source_port=0):
-    """ Method try to get host public address with STUN protocol
+    """This method tries to get host public address with STUN protocol
     :param int source_port: port that should be used for connection.
     If 0, a free port will be picked by OS.
     :return (str, int, str): tuple with host public address, public port that is
     mapped to local <source_port> and this host nat type
     """
     nat_type, external_ip, external_port = stun.get_ip_info(source_port=source_port)
-    logger.debug("NAT {}, external [{}] {}".format(nat_type, external_ip, external_port))
+    logger.debug("NAT %r, external_ip [%r] External_port %r",
+                 nat_type, external_ip, external_port)
     return external_ip, external_port, nat_type
-
 
 def get_host_address(seed_addr=None, use_ipv6=False):
     """

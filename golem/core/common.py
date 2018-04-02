@@ -1,13 +1,16 @@
 import collections
 import logging.config
 import os
+import subprocess
 import sys
 from calendar import timegm
 from datetime import datetime
 from multiprocessing import cpu_count
 
 import pytz
-from pathlib import Path
+
+from golem.core import simpleenv
+from golem.core.variables import REACTOR_THREAD_POOL_SIZE
 
 TIMEOUT_FORMAT = '{}:{:0=2d}:{:0=2d}'
 DEVNULL = open(os.devnull, 'wb')
@@ -53,8 +56,7 @@ def to_unicode(value):
     try:
         if isinstance(value, bytes):
             return value.decode('utf-8')
-        else:
-            return str(value)
+        return str(value)
     except UnicodeDecodeError:
         return value
 
@@ -161,30 +163,41 @@ class HandleAttributeError(HandleError):
         )
 
 
-def config_logging(suffix='', datadir=None):
+def config_logging(suffix='', datadir=None, loglevel=None):
     """Config logger"""
     try:
         from loggingconfig_local import LOGGING
     except ImportError:
         from loggingconfig import LOGGING
 
-    logdir_path = Path('logs')
-    if datadir is not None:
-        logdir_path = Path(datadir) / logdir_path
-        datadir += '/'
-    else:
-        datadir = ''
-    if not logdir_path.exists():
-        logdir_path.mkdir(parents=True)
+    if datadir is None:
+        datadir = simpleenv.get_local_datadir("default")
+    logdir_path = os.path.join(datadir, 'logs')
 
-    for handler in list(LOGGING.get('handlers', {}).values()):
+    for handler in LOGGING.get('handlers', {}).values():
+        if loglevel:
+            handler['level'] = loglevel
         if 'filename' in handler:
             handler['filename'] %= {
-                'datadir': datadir,
+                'logdir': str(logdir_path),
                 'suffix': suffix,
             }
 
-    logging.config.dictConfig(LOGGING)
+    if loglevel:
+        for _logger in LOGGING.get('loggers', {}).values():
+            _logger['level'] = loglevel
+        LOGGING['root']['level'] = loglevel
+
+    try:
+        if not os.path.exists(logdir_path):
+            os.makedirs(logdir_path)
+
+        logging.config.dictConfig(LOGGING)
+    except (ValueError, PermissionError) as e:
+        sys.stderr.write(
+            "Can't configure logging in: {} Got: {}\n".format(logdir_path, e)
+        )
+        return  # Avoid consequent errors
     logging.captureWarnings(True)
 
     import txaio
@@ -197,7 +210,11 @@ def config_logging(suffix='', datadir=None):
 
     crossbar_log_lvl = logging.getLevelName(
         logging.getLogger('golem.rpc.crossbar').level).lower()
-    txaio.set_global_log_level(crossbar_log_lvl)
+    # Fix inconsistency in log levels, only warn affected
+    if crossbar_log_lvl == 'warning':
+        crossbar_log_lvl = 'warn'
+
+    txaio.set_global_log_level(crossbar_log_lvl)  # pylint: disable=no-member
 
 
 def get_cpu_count():
@@ -212,3 +229,24 @@ def get_cpu_count():
     if is_osx():
         return min(cpu_count(), MAX_CPU_MACOS)    # xhyve limitation
     return cpu_count()  # No limitatons on Linux
+
+
+def install_reactor():
+
+    if is_windows():
+        from twisted.internet import iocpreactor
+        iocpreactor.install()
+    elif is_osx():
+        from twisted.internet import kqreactor
+        kqreactor.install()
+
+    from twisted.internet import reactor
+    reactor.suggestThreadPoolSize(REACTOR_THREAD_POOL_SIZE)
+    return reactor
+
+
+if is_windows():
+    SUBPROCESS_STARTUP_INFO = subprocess.STARTUPINFO()
+    SUBPROCESS_STARTUP_INFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+else:
+    SUBPROCESS_STARTUP_INFO = None

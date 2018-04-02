@@ -2,7 +2,7 @@ from contextlib import contextmanager
 from functools import wraps
 
 from golem.core.common import to_unicode
-from golem.rpc.mapping.aliases import Golem
+from golem.rpc.mapping.rpceventnames import Golem
 
 
 class Stage(object):
@@ -22,6 +22,7 @@ class Component(object):
     docker = 'docker'
     hypervisor = 'hypervisor'
     ethereum = 'ethereum'
+    hyperdrive = 'hyperdrive'
 
 
 class StatusPublisher(object):
@@ -45,13 +46,16 @@ class StatusPublisher(object):
         :return: None
         """
         if cls._rpc_publisher:
+            from twisted.internet import reactor
+
             cls._last_status = (to_unicode(component),
                                 to_unicode(method),
                                 to_unicode(stage),
                                 data)
 
-            cls._rpc_publisher.publish(Golem.evt_golem_status,
-                                       *cls._last_status)
+            reactor.callFromThread(cls._rpc_publisher.publish,
+                                   Golem.evt_golem_status,
+                                   *cls._last_status)
 
     @classmethod
     def last_status(cls):

@@ -52,7 +52,7 @@ class Settings(object):
             lambda x: str(x) if isinstance(x, str) else None,
             lambda x: x and len(x) > 0
         ),
-        'accept_task': Setting(
+        'accept_tasks': Setting(
             'Accept tasks',
             'int {0, 1}',
             _int,
@@ -61,18 +61,6 @@ class Settings(object):
         'max_resource_size': Setting(
             'Maximal resource size',
             'int > 0 [kB]',
-            _int,
-            lambda x: x > 0
-        ),
-        'use_waiting_for_task_timeout': Setting(
-            'Use timeouts when waiting for tasks',
-            'int {0, 1}',
-            _int,
-            lambda x: x in [0, 1]
-        ),
-        'waiting_for_task_timeout': Setting(
-            'Timeout value to use when waiting for task',
-            'int > 0 [s]',
             _int,
             lambda x: x > 0
         ),
@@ -159,6 +147,12 @@ class Settings(object):
             '{} >= int >= 1'.format(_cpu_count),
             _int,
             lambda x: _cpu_count >= x >= 1
+        ),
+        'enable_talkback': Setting(
+            'Enable error reporting with talkback service',
+            'int {0, 1}',
+            _int,
+            lambda x: x in [0, 1]
         )
     }
 

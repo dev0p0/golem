@@ -3,8 +3,9 @@ import logging
 import os
 from os import makedirs, path, remove
 import shutil
+from unittest import mock
+from unittest.mock import Mock
 
-from mock import Mock
 import pytest
 
 from apps.lux.task.luxrendertask import LuxRenderTaskBuilder, LuxTask
@@ -12,7 +13,7 @@ from golem.clientconfigdescriptor import ClientConfigDescriptor
 from golem.core.common import get_golem_path, timeout_to_deadline
 from golem.core.fileshelper import find_file_with_ext
 from golem.core.simpleserializer import DictSerializer
-from golem.node import OptNode
+from golem.node import Node
 
 from golem.task.taskbase import ResultType
 from golem.resource.dirmanager import DirManager
@@ -31,7 +32,7 @@ logging.getLogger("peewee").setLevel("INFO")
 
 
 # TODO: extract code common to this class and TestDockerBlenderTask
-# to a superclass
+# to a superclass, issue: G #2393
 
 @ci_skip
 class TestDockerLuxrenderTask(TempDirFixture, DockerTestCase):
@@ -80,6 +81,7 @@ class TestDockerLuxrenderTask(TempDirFixture, DockerTestCase):
         return task_def
 
     def _test_task(self) -> LuxTask:
+        LuxTask.VERIFICATION_QUEUE._reset()
         task_def = self._test_task_definition()
         node_name = "0123456789abcdef"
         dir_manager = DirManager(self.path)
@@ -94,17 +96,33 @@ class TestDockerLuxrenderTask(TempDirFixture, DockerTestCase):
         task_id = render_task.header.task_id
         extra_data = render_task.query_extra_data(1.0)
         ctd = extra_data.ctd
-        ctd.deadline = timeout_to_deadline(timeout)
+        ctd['deadline'] = timeout_to_deadline(timeout)
 
         # Create the computing node
-        self.node = OptNode(datadir=self.path, use_docker_machine_manager=False)
+        self.node = Node(
+            datadir=self.path,
+            app_config=Mock(),
+            config_desc=ClientConfigDescriptor(),
+            use_docker_manager=False,
+        )
+        with mock.patch('golem.client.EthereumTransactionSystem'):
+            self.node.client = self.node._client_factory(Mock())
         self.node.client.start = Mock()
         self.node._run()
 
         ccd = ClientConfigDescriptor()
 
-        task_server = TaskServer(Mock(), ccd, Mock(), self.node.client,
-                                 use_docker_machine_manager=False)
+        with mock.patch(
+                "golem.network.concent.handlers_library"
+                ".HandlersLibrary"
+                ".register_handler"):
+            task_server = TaskServer(
+                node=Mock(),
+                config_desc=ccd,
+                client=self.node.client,
+                use_docker_manager=False
+            )
+        task_server.create_and_set_result_package = Mock()
         task_server.task_keeper.task_headers[task_id] = render_task.header
         task_computer = task_server.task_computer
 
@@ -125,14 +143,14 @@ class TestDockerLuxrenderTask(TempDirFixture, DockerTestCase):
                 makedirs(dest_dirname)
             shutil.copyfile(res_file, dest_file)
 
-        def send_task_failed(self_, subtask_id, task_id, error_msg, *args):
+        def send_task_failed(_, __, ___, error_msg):
             self.error_msg = error_msg
 
         TaskServer.send_task_failed = send_task_failed
 
         # Start task computation
         task_computer.task_given(ctd)
-        result = task_computer.resource_given(ctd.task_id)
+        result = task_computer.resource_given(ctd['task_id'])
         self.assertTrue(result)
 
         # Thread for task computation should be created by now
@@ -206,8 +224,10 @@ class TestDockerLuxrenderTask(TempDirFixture, DockerTestCase):
 
         return new_flm_file, new_file
 
-    @pytest.mark.slow
-    def test_luxrender_real_task_png(self):
+    # @pytest.mark.slow
+    @mock.patch('apps.core.task.verifier.deadline_to_timeout')
+    def test_luxrender_real_task_png(self, mock_dtt):
+        mock_dtt.return_value = 1.0
         task = self._test_task()
         task.output_format = "png"
         task.res_y = 200
@@ -221,7 +241,9 @@ class TestDockerLuxrenderTask(TempDirFixture, DockerTestCase):
         self._test_luxrender_real_task(task)
 
     @pytest.mark.slow
-    def test_luxrender_real_task_exr(self):
+    @mock.patch('apps.core.task.verifier.deadline_to_timeout')
+    def test_luxrender_real_task_exr(self, mock_dtt):
+        mock_dtt.return_value = 1.0
         task = self._test_task()
         task.output_format = "exr"
         task.res_y = 200
@@ -229,7 +251,7 @@ class TestDockerLuxrenderTask(TempDirFixture, DockerTestCase):
         task.haltspp = 20
         # 1) to make it deterministic,
         # 2) depending on the kernel, small cropwindow can generate darker img,
-        # this is a know issue in lux:
+        # this is a known issue in lux:
         # http: // www.luxrender.net / forum / viewtopic.php?f = 16 & t = 13389
         task.random_crop_window_for_verification = (0.05, 0.95, 0.05, 0.95)
         self._test_luxrender_real_task(task)
@@ -238,94 +260,43 @@ class TestDockerLuxrenderTask(TempDirFixture, DockerTestCase):
         ctd = task.query_extra_data(10000).ctd
         # act
         computer = LocalComputer(
-            task,
-            self.tempdir,
-            Mock(),
-            Mock(),
-            lambda: ctd,
+            root_path=self.tempdir,
+            success_callback=Mock(),
+            error_callback=Mock(),
+            compute_task_def=ctd,
+            resources=task.task_resources
         )
 
         computer.run()
         computer.tt.join()
 
         new_flm_file, new_preview_file = self._extract_results(computer, task,
-                                                               ctd.subtask_id)
+                                                               ctd['subtask_id'])  # noqa
 
         task.create_reference_data_for_task_validation()
 
         # assert good results - should pass
         self.assertEqual(task.num_tasks_received, 0)
-        task.computation_finished(ctd.subtask_id,
+        task.computation_finished(ctd['subtask_id'],
                                   [new_flm_file, new_preview_file],
-                                  result_type=ResultType.FILES)
+                                  result_type=ResultType.FILES,
+                                  verification_finished_=lambda: None)
 
 
-        is_subtask_verified = task.verify_subtask(ctd.subtask_id)
+        is_subtask_verified = task.verify_subtask(ctd['subtask_id'])
         self.assertTrue(is_subtask_verified)
         self.assertEqual(task.num_tasks_received, 1)
 
         # assert bad results - should fail
         bad_flm_file = path.join(path.dirname(new_flm_file), "badfile.flm")
         ctd = task.query_extra_data(10000).ctd
-        task.computation_finished(ctd.subtask_id,
+        task.computation_finished(ctd['subtask_id'],
                                   [bad_flm_file, new_preview_file],
-                                  result_type=ResultType.FILES)
+                                  result_type=ResultType.FILES,
+                                  verification_finished_=lambda: None)
 
-        self.assertFalse(task.verify_subtask(ctd.subtask_id))
+        self.assertFalse(task.verify_subtask(ctd['subtask_id']))
         self.assertEqual(task.num_tasks_received, 1)
-
-    def test_run_stats(self):
-        results = []
-        return
-
-        # FIXME Unreachable code
-        for i in range(0, 10):
-            task = self._test_task()
-            task.output_format = "png"
-            task.res_y = 200
-            task.res_x = 200
-            task.haltspp = 20
-            # 1) to make it deterministic,
-            # 2) depending on the kernel, small cropwindow can generate darker
-            # img, this is a know issue in lux:
-            # http://www.luxrender.net/forum/viewtopic.php?f=16&t=13389
-            task.random_crop_window_for_verification = (0.05, 0.95, 0.05, 0.95)
-            ctd = task.query_extra_data(10000).ctd
-
-            # act
-            computer = LocalComputer(
-                task,
-                self.tempdir,
-                Mock(),
-                Mock(),
-                lambda: ctd,
-            )
-
-            computer.run()
-            computer.tt.join()
-
-            new_flm_file, new_png_file = self._extract_results(computer, task,
-                                                               ctd.subtask_id)
-
-            task.create_reference_data_for_task_validation()
-
-            # assert good results - should pass
-            self.assertEqual(task.num_tasks_received, 0)
-            task.computation_finished(ctd.subtask_id,
-                                      [new_flm_file, new_png_file],
-                                      result_type=ResultType.FILES)
-
-            result = task.verify_subtask(ctd.subtask_id)
-            # self.assertEqual(task.num_tasks_received, 1)
-            # print i, task.num_tasks_received
-            results.append(result)
-            print(i, result)
-
-        from collections import Counter
-        stats = Counter(results)
-        print(results)
-        print(stats)
-
 
     def test_luxrender_TaskTester_should_pass(self):
         task = self._test_task()

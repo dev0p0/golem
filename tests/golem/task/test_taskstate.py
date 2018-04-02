@@ -1,5 +1,6 @@
-import time
 import unittest
+
+from freezegun import freeze_time
 
 from golem.core.common import timeout_to_deadline, deadline_to_timeout, \
     get_timestamp_utc
@@ -17,7 +18,9 @@ class TestSubtaskState(unittest.TestCase):
         self.assertEqual(ss.results, [1])
         self.assertEqual(ss2.results, [2])
 
-    def test_to_dictionary(self):
+    @staticmethod
+    @freeze_time()
+    def test_to_dictionary():
         ss = SubtaskState()
         ss.subtask_definition = "My long task definition"
         ss.subtask_id = "ABCDEF"
@@ -42,12 +45,12 @@ class TestSubtaskState(unittest.TestCase):
         assert ss_dict['description'] == "My long task definition"
         assert ss_dict['subtask_id'] == "ABCDEF"
         assert ss_dict['progress'] == 0.92
-        assert ss_dict['time_started'] <= time.time()
+        assert ss_dict['time_started'] == get_timestamp_utc()
 
         assert ss_dict.get('deadline') is None
         assert ss_dict.get('extra_data') is None
 
-        assert ss_dict['time_remaining'] <= 5
+        assert ss_dict['time_remaining'] == 5
         assert ss_dict['status'] == SubtaskStatus.starting
 
         assert ss_dict.get('value') is None

@@ -1,3 +1,4 @@
+import copy
 import logging
 import os
 import string
@@ -11,7 +12,7 @@ from golem.resource.dirmanager import split_path
 logger = logging.getLogger(__name__)
 
 
-class TaskResourceHeader(object):
+class TaskResourceHeader():
     def __init__(self, dir_name):
         self.sub_dir_headers = []
         self.files_data = []
@@ -433,17 +434,13 @@ def compress_dir(root_path, header, output_dir):
 
     zipf = zipfile.ZipFile(output_file, 'w', compression=zipfile.ZIP_DEFLATED, allowZip64=True)
 
-    cur_working_dir = os.getcwd()
-    os.chdir(root_path)
-    logger.debug("Working directory {}".format(os.getcwd()))
-
     try:
-        compress_dir_impl("", header, zipf)
+        compress_dir_impl(root_path, header, zipf)
+    except ValueError as e:
+        logger.warning("Unexpected error %r during copmressing %r",
+                       e, output_file)
 
-        zipf.close()
-    finally:
-        os.chdir(cur_working_dir)
-        logger.debug("Return to prev working directory {}".format(os.getcwd()))
+    zipf.close()
 
     return output_file
 
@@ -454,15 +451,43 @@ def decompress_dir(root_path, zip_file):
     zipf.extractall(root_path)
 
 
-def compress_dir_impl(root_path, header, zipf):
+def compress_dir_impl(root_path, header, zipf, rel_path=""):
     for sdh in header.sub_dir_headers:
-        compress_dir_impl(os.path.join(root_path, sdh.dir_name), sdh, zipf)
+        compress_dir_impl(os.path.join(root_path, sdh.dir_name),
+                          sdh, zipf, os.path.join(rel_path, sdh.dir_name))
 
     for fdata in header.files_data:
-        zipf.write(os.path.join(root_path, fdata[0]))
+        zipf.write(os.path.join(root_path, fdata[0]),
+                   os.path.join(rel_path, fdata[0]))
 
 
 def prepare_delta_zip(root_dir, header, output_dir, chosen_files=None):
     # delta_header = TaskResourceHeader.build_header_delta_from_header(header, root_dir, chosen_files)
     delta_header = TaskResourceHeader.build_header_delta_from_chosen(header, root_dir, chosen_files)
     return compress_dir(root_dir, delta_header, output_dir)
+
+
+class ResourceType(object):  # class ResourceType(Enum):
+    ZIP = 0
+    PARTS = 1
+    HASHES = 2
+
+
+def get_resources_for_task(resource_header, resources, tmp_dir,
+                           resource_type=ResourceType.ZIP):
+    dir_name = get_resources_root_dir(resources)
+
+    if os.path.exists(dir_name):
+        if resource_type == ResourceType.ZIP:
+            return prepare_delta_zip(dir_name, resource_header, tmp_dir,
+                                     resources)
+        elif resource_type == ResourceType.HASHES:
+            return copy.copy(resources)
+
+    return None
+
+
+def get_resources_root_dir(resources):
+    resources = list(resources)
+    prefix = os.path.commonprefix(resources)
+    return os.path.dirname(prefix)

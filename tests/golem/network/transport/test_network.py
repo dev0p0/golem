@@ -1,13 +1,17 @@
+from contextlib import contextmanager
 import logging
 import os
 import time
 import unittest
-from contextlib import contextmanager
 
-from golem.core.databuffer import DataBuffer
-from golem.network.transport.message import Message, MessageHello
-from golem.network.transport.network import ProtocolFactory, SessionFactory, SessionProtocol
-from golem.network.transport.tcpnetwork import TCPNetwork, TCPListenInfo, TCPListeningInfo, TCPConnectInfo, \
+from golem_messages import message
+import golem_messages.cryptography
+
+from golem.network.transport.network import ProtocolFactory, SessionFactory, \
+    SessionProtocol
+from golem.network.transport import session
+from golem.network.transport.tcpnetwork import TCPNetwork, TCPListenInfo, \
+    TCPListeningInfo, TCPConnectInfo, \
     SocketAddress, BasicProtocol, ServerProtocol, SafeProtocol
 from golem.tools.testwithreactor import TestWithReactor
 
@@ -19,26 +23,16 @@ class ASession(object):
         self.conn = conn
         self.dropped_called = False
         self.msgs = []
+        my_keys = golem_messages.cryptography.ECCx(None)
+        their_keys = my_keys  # speedup
+        self.my_private_key = my_keys.raw_privkey
+        self.theirs_public_key = their_keys.raw_pubkey
 
     def dropped(self):
         self.dropped_called = True
 
     def interpret(self, msg):
         self.msgs.append(msg)
-
-    def sign(self, msg):
-        msg.sig = "ASessionSign"
-        return msg
-
-    def encrypt(self, msg):
-        return b"ASessionEncrypt" + bytes(msg)
-
-    def decrypt(self, msg):
-        args = [msg, b"ASessionEncrypt"]
-        if os.path.commonprefix(args) != b"ASessionEncrypt":
-            return None
-        else:
-            return msg[len(b"ASessionEncrypt"):]
 
 
 class AProtocol(SessionProtocol):
@@ -81,7 +75,6 @@ class TestNetwork(TestWithReactor):
         self.connect_success = None
         self.stop_listening_success = None
         self.port = None
-        self.kwargs_len = 0
         session_factory = SessionFactory(ASession)
         protocol_factory = ProtocolFactory(SafeProtocol, Server(), session_factory)
         self.network = TCPNetwork(protocol_factory)
@@ -148,9 +141,8 @@ class TestNetwork(TestWithReactor):
         self.assertEqual(len(self.network.active_listeners), 2)
 
         with async_scope(listen_status):
-            self.network.listen(listen_info, a=1, b=2, c=3, d=4, e=5)
+            self.network.listen(listen_info)
         self.assertEqual(self.port, port + 2)
-        self.assertEqual(self.kwargs_len, 5)
         self.assertEqual(len(self.network.active_listeners), 3)
 
         # connect
@@ -235,12 +227,11 @@ class TestNetwork(TestWithReactor):
             self.network.stop_listening(listening_info)
         self.assertEqual(len(self.network.active_listeners), 0)
 
-    def __listen_success(self, port, **kwargs):
+    def __listen_success(self, port):
         self.listen_success = True
         self.port = port
-        self.kwargs_len = len(kwargs)
 
-    def __listen_failure(self, **kwargs):
+    def __listen_failure(self):
         self.port = None
         self.listen_success = False
 
@@ -353,22 +344,22 @@ class TestBasicProtocol(unittest.TestCase):
         session_factory = SessionFactory(ASession)
         p.set_session_factory(session_factory)
         self.assertFalse(p.send_message("123"))
-        msg = MessageHello()
+        msg = message.Hello()
         self.assertFalse(p.send_message(msg))
         p.connectionMade()
         self.assertTrue(p.send_message(msg))
         self.assertEqual(len(p.transport.buff), 1)
         p.dataReceived(p.transport.buff[0])
-        self.assertIsInstance(p.session.msgs[0], MessageHello)
+        self.assertIsInstance(p.session.msgs[0], message.Hello)
         self.assertEqual(msg.timestamp, p.session.msgs[0].timestamp)
         time.sleep(1)
-        msg = MessageHello()
+        msg = message.Hello()
         self.assertNotEqual(msg.timestamp, p.session.msgs[0].timestamp)
         self.assertTrue(p.send_message(msg))
         self.assertEqual(len(p.transport.buff), 2)
-        db = DataBuffer()
-        db.append_string(p.transport.buff[1])
-        m = Message.deserialize(db)[0]
+        db = p.db
+        db.append_bytes(p.transport.buff[1])
+        m = p._data_to_messages()[0]
         self.assertEqual(m.timestamp, msg.timestamp)
         p.connectionLost()
         self.assertNotIn('session', p.__dict__)
@@ -392,15 +383,13 @@ class TestSaferProtocol(unittest.TestCase):
         session_factory = SessionFactory(ASession)
         p.set_session_factory(session_factory)
         self.assertFalse(p.send_message("123"))
-        msg = MessageHello()
-        self.assertEqual(msg.sig, "")
+        msg = message.Hello()
+        self.assertIsNone(msg.sig)
         self.assertFalse(p.send_message(msg))
         p.connectionMade()
         self.assertTrue(p.send_message(msg))
         self.assertEqual(len(p.transport.buff), 1)
         p.dataReceived(p.transport.buff[0])
-        self.assertIsInstance(p.session.msgs[0], MessageHello)
-        self.assertEqual(msg.timestamp, p.session.msgs[0].timestamp)
-        self.assertEqual(msg.sig, "ASessionSign")
+        self.assertIsInstance(p.session.msgs[0], message.Hello)
         p.connectionLost()
         self.assertNotIn('session', p.__dict__)

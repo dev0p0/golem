@@ -1,19 +1,18 @@
 from typing import Dict, Any
+import getpass
 
 from ethereum.utils import denoms
 
 from golem.core.deferred import sync_wait
 from golem.interface.command import command, group
-# For type annotations:
-from golem.client import Client  # pylint: disable=unused-import
 
 
 @group(help="Manage account")
 class Account:
-    client = None  # type: Client
+    client = None  # type: 'golem.rpc.session.Client'
 
     @command(help="Display account & financial info")
-    def info(self) -> Dict[str, Any]:
+    def info(self) -> Dict[str, Any]:  # pylint: disable=no-self-use
         client = Account.client
 
         node = sync_wait(client.get_node())
@@ -27,7 +26,7 @@ class Account:
         if any(b is None for b in balance):
             balance = 0, 0, 0
 
-        gnt_balance, gnt_available, eth_balance = balance
+        gnt_balance, gnt_available, eth_balance = balance[:3]
         gnt_balance = float(gnt_balance)
         gnt_available = float(gnt_available)
         eth_balance = float(eth_balance)
@@ -46,6 +45,30 @@ class Account:
                 eth_balance=_fmt(eth_balance, unit="ETH")
             )
         )
+
+    @command(help="Unlock account, will prompt for your password")
+    def unlock(self) -> str:  # pylint: disable=no-self-use
+        client = Account.client
+        has_key = sync_wait(client.key_exists())
+
+        if not has_key:
+            print("No account found, generate one by setting a password")
+        else:
+            print("Unlock your account to start golem")
+
+        pswd = getpass.getpass('Password:')
+
+        if not has_key:
+            confirm = getpass.getpass('Confirm password:')
+            if confirm != pswd:
+                return "Password and confirmation do not match."
+            print("Generating keys, this can take up to 10 minutes...")
+
+        success = sync_wait(client.set_password(pswd), timeout=15 * 60)
+        if not success:
+            return "Incorrect password"
+
+        return "Account unlock success"
 
 
 def _fmt(value: float, unit: str = "GNT") -> str:

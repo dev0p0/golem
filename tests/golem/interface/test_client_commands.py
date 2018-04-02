@@ -1,12 +1,13 @@
-import json
-import io
-import unittest
-import uuid
 from collections import namedtuple
 from contextlib import contextmanager
+from functools import partial
+import io
+import json
+import unittest
+from unittest.mock import MagicMock, Mock, mock_open, patch
+import uuid
 
 from ethereum.utils import denoms
-from mock import Mock, mock_open, patch
 
 from apps.core.task.coretaskstate import TaskDefinition
 from golem.appconfig import AppConfig, MIN_MEMORY_SIZE
@@ -19,11 +20,11 @@ from golem.interface.client.payments import incomes, payments
 from golem.interface.client.resources import Resources
 from golem.interface.client.settings import Settings, _virtual_mem, _cpu_count
 from golem.interface.client.tasks import Subtasks, Tasks
+from golem.interface.client.terms import Terms
 from golem.interface.command import CommandResult, client_ctx
 from golem.interface.exceptions import CommandException
 from golem.resource.dirmanager import DirManager, DirectoryType
-from golem.rpc.mapping import aliases
-from golem.rpc.mapping.core import CORE_METHOD_MAP
+from golem.rpc.mapping.rpcmethodnames import CORE_METHOD_MAP
 from golem.rpc.session import Client
 from golem.task.tasktester import TaskTester
 from golem.testutils import TempDirFixture
@@ -37,6 +38,7 @@ def assert_client_method(instance, name):
 
 
 class TestAccount(unittest.TestCase):
+
     def test(self):
 
         node = dict(node_name='node1', key='deadbeef')
@@ -71,6 +73,7 @@ class TestAccount(unittest.TestCase):
 
 
 class TestEnvironments(unittest.TestCase):
+
     @classmethod
     def setUpClass(cls):
 
@@ -138,6 +141,7 @@ class TestEnvironments(unittest.TestCase):
 
 
 class TestNetwork(unittest.TestCase):
+
     @classmethod
     def setUpClass(cls):
 
@@ -234,14 +238,14 @@ class TestNetwork(unittest.TestCase):
 
 
 class TestPayments(unittest.TestCase):
+
     @classmethod
     def setUpClass(cls):
 
         incomes_list = [{
-            'value': '{}'.format(i),
             'payer': 'node_{}'.format(i),
             'status': 'waiting',
-            'block_number': 'deadbeef0{}'.format(i)
+            'value': '{}'.format(i),
         } for i in range(1, 6)]
 
         payments_list = [{
@@ -269,7 +273,7 @@ class TestPayments(unittest.TestCase):
             assert result.type == CommandResult.TABULAR
             assert len(result.data[1]) == self.n_incomes
             assert result.data[1][0] == [
-                'node_1', 'waiting', '0.000000 GNT', 'deadbeef01'
+                'node_1', 'waiting', '0.000000 GNT'
             ]
 
     def test_payments(self):
@@ -290,6 +294,7 @@ class TestPayments(unittest.TestCase):
 
 
 class TestResources(unittest.TestCase):
+
     def setUp(self):
         super(TestResources, self).setUp()
         self.client = Mock()
@@ -347,6 +352,7 @@ def _has_subtask(id):
 
 
 class TestTasks(TempDirFixture):
+
     @classmethod
     def setUpClass(cls):
         super(TestTasks, cls).setUpClass()
@@ -367,10 +373,21 @@ class TestTasks(TempDirFixture):
             'progress': i / 100.0
         } for i in range(1, 6)]
 
+        cls.reasons = [
+            {'avg': '0.8.1', 'reason': 'app_version', 'ntasks': 3},
+            {'avg': 7, 'reason': 'max_price', 'ntasks': 2},
+            {'avg': None, 'reason': 'environment_missing', 'ntasks': 1},
+            {'avg': None,
+             'reason': 'environment_not_accepting_tasks', 'ntasks': 1},
+            {'avg': None, 'reason': 'requesting_trust', 'ntasks': 0},
+            {'avg': None, 'reason': 'deny_list', 'ntasks': 0},
+            {'avg': None, 'reason': 'environment_unsupported', 'ntasks': 0}]
+
         cls.n_tasks = len(cls.tasks)
         cls.n_subtasks = len(cls.subtasks)
         cls.get_tasks = lambda s, _id: cls.tasks[0] if _id else cls.tasks
         cls.get_subtasks = lambda s, x: cls.subtasks
+        cls.get_unsupport_reasons = lambda s, x: cls.reasons
 
     def setUp(self):
         super(TestTasks, self).setUp()
@@ -384,6 +401,8 @@ class TestTasks(TempDirFixture):
 
         client.get_tasks = self.get_tasks
         client.get_subtasks = self.get_subtasks
+        client.get_unsupport_reasons = self.get_unsupport_reasons
+        client.keys_auth = Mock(public_key=b'a' * 128)
 
         self.client = client
 
@@ -402,26 +421,38 @@ class TestTasks(TempDirFixture):
             assert tasks.stats()
             client.get_task_stats.assert_called_with()
 
-    @patch("golem.interface.client.tasks.uuid4")
-    def test_create(self, mock_uuid) -> None:
+    def test_create(self) -> None:
         client = self.client
-        mock_uuid.return_value = "new_uuid"
 
         definition = TaskDefinition()
-        definition.task_name = "The greatest task ever!"
+        definition.task_name = "The greatest task ever"
         def_str = json.dumps(definition.to_dict())
 
         with client_ctx(Tasks, client):
             tasks = Tasks()
             tasks._Tasks__create_from_json(def_str)
             task_def = json.loads(def_str)
-            task_def['id'] = "new_uuid"
             client.create_task.assert_called_with(task_def)
 
             patched_open = "golem.interface.client.tasks.open"
             with patch(patched_open, mock_open(read_data='{}')):
+                self.assertRaises(ValueError, partial(tasks.create, "foo"))
+
+            with patch(patched_open, mock_open(
+                read_data='{"name": "This name has 27 characters"}'
+            )):
+                self.assertRaises(ValueError, partial(tasks.create, "foo"))
+
+            with patch(patched_open, mock_open(
+                read_data='{"name": "Golem task/"}'
+            )):
+                self.assertRaises(ValueError, partial(tasks.create, "foo"))
+
+            with patch(patched_open, mock_open(
+                read_data='{"name": "Golem task"}'
+            )):
                 tasks.create("foo")
-                task_def = json.loads('{"id": "new_uuid"}')
+                task_def = json.loads('{"name": "Golem task"}')
                 client.create_task.assert_called_with(task_def)
 
     def test_template(self) -> None:
@@ -488,6 +519,17 @@ class TestTasks(TempDirFixture):
                 'node_1', 'subtask_1', '9', 'waiting', '1.00 %'
             ]
 
+    def test_unsupport(self):
+        client = self.client
+
+        with client_ctx(Tasks, client):
+            tasks = Tasks()
+            unsupport = tasks.unsupport(0)
+            assert isinstance(unsupport, CommandResult)
+            assert unsupport.data[1][0] == ['app_version', 3, '0.8.1']
+            assert unsupport.data[1][1] == ['max_price', 2, 7]
+            assert unsupport.data[1][2] == ['environment_missing', 1, None]
+
     @staticmethod
     @contextmanager
     def _run_context(method):
@@ -498,6 +540,7 @@ class TestTasks(TempDirFixture):
 
 
 class TestSubtasks(unittest.TestCase):
+
     def setUp(self):
         super(TestSubtasks, self).setUp()
 
@@ -530,6 +573,7 @@ class TestSubtasks(unittest.TestCase):
 
 
 class TestSettings(TempDirFixture):
+
     def setUp(self):
         super(TestSettings, self).setUp()
 
@@ -584,10 +628,8 @@ class TestSettings(TempDirFixture):
 
         _setting_values = {
             'node_name': Values(['node'], ['', None, 12, lambda x: x]),
-            'accept_task': _bool,
+            'accept_tasks': _bool,
             'max_resource_size': _int_gt0,
-            'use_waiting_for_task_timeout': _bool,
-            'waiting_for_task_timeout': _int_gt0,
             'getting_tasks_interval': _int_gt0,
             'getting_peers_interval': _int_gt0,
             'task_session_timeout': _int_gt0,
@@ -642,6 +684,7 @@ class TestSettings(TempDirFixture):
 
 
 class TestDebug(unittest.TestCase):
+
     def setUp(self):
         super(TestDebug, self).setUp()
 
@@ -655,14 +698,40 @@ class TestDebug(unittest.TestCase):
             debug = Debug()
             task_id = str(uuid.uuid4())
 
-            debug.rpc((aliases.Network.ident, ))
+            debug.rpc(('net.ident',))
             assert client.get_node.called
 
-            debug.rpc((aliases.Task.task, task_id))
+            debug.rpc(('comp.task', task_id))
             client.get_task.assert_called_with(task_id)
 
-            debug.rpc((aliases.Task.subtasks_borders, task_id, 2))
+            debug.rpc(('comp.task.subtasks.borders', task_id, 2))
             client.get_subtasks_borders.assert_called_with(task_id, 2)
 
             with self.assertRaises(CommandException):
                 debug.rpc((task_id, ))
+
+
+class TestTerms(unittest.TestCase):
+
+    def setUp(self):
+        super(TestTerms, self).setUp()
+
+        self.client = Mock()
+        self.client.__getattribute__ = assert_client_method
+
+    @patch('golem.interface.client.terms.html2text.html2text',
+           return_value=object())
+    def test_show(self, html2text: MagicMock):
+        with client_ctx(Terms, self.client):
+            terms = Terms()
+            result = terms.show()
+            self.client.show_terms.assert_called_once()
+            html2text.assert_called_once_with(
+                self.client.show_terms.return_value)
+            self.assertEqual(result, html2text.return_value)
+
+    def test_accept(self):
+        with client_ctx(Terms, self.client):
+            terms = Terms()
+            terms.accept()
+            self.client.accept_terms.assert_called_once()

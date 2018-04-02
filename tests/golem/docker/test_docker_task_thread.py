@@ -1,15 +1,14 @@
 import time
 from threading import Thread
-
-from mock import Mock
+from unittest import TestCase
+from unittest.mock import Mock
 
 from golem.clientconfigdescriptor import ClientConfigDescriptor
 from golem.docker.image import DockerImage
-from golem.docker.task_thread import DockerTaskThread
+from golem.docker.task_thread import DockerTaskThread, EXIT_CODE_MESSAGE
 from golem.task.taskcomputer import TaskComputer
 from golem.tools.ci import ci_skip
 from golem.tools.testwithdatabase import TestWithDatabase
-
 from .test_docker_job import TestDockerJob
 
 
@@ -33,7 +32,7 @@ class TestDockerTaskThread(TestDockerJob, TestWithDatabase):
         task_server.get_task_computer_root.return_value = \
             task_server.client.datadir
         task_computer = TaskComputer("node", task_server,
-                                     use_docker_machine_manager=False)
+                                     use_docker_manager=False)
         image = DockerImage("golemfactory/base", tag="1.2")
 
         with self.assertRaises(AttributeError):
@@ -68,3 +67,16 @@ class TestDockerTaskThread(TestDockerJob, TestWithDatabase):
                 ct = task_computer.counting_thread
 
             time.sleep(1)
+
+
+class TestExitCodeMessage(TestCase):
+
+    def test_exit_code_message(self):
+        exit_code = 1
+        message = DockerTaskThread._exit_code_message(exit_code)
+        assert message == EXIT_CODE_MESSAGE.format(exit_code)
+
+        exit_code = 137
+        message = DockerTaskThread._exit_code_message(exit_code)
+        assert message != EXIT_CODE_MESSAGE.format(exit_code)
+        assert "out-of-memory" in message

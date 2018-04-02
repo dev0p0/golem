@@ -1,10 +1,10 @@
+import json
 import logging
 import os
-import shutil
 from os import makedirs, path, remove
-
-import json
-from mock import Mock
+import shutil
+from unittest import mock
+from unittest.mock import Mock
 
 from apps.dummy.task.dummytask import DummyTaskBuilder, DummyTask
 from apps.dummy.task.dummytaskstate import DummyTaskDefinition
@@ -12,7 +12,7 @@ from golem.clientconfigdescriptor import ClientConfigDescriptor
 from golem.core.common import get_golem_path, timeout_to_deadline
 from golem.core.fileshelper import find_file_with_ext
 from golem.core.simpleserializer import DictSerializer
-from golem.node import OptNode
+from golem.node import Node
 from golem.resource.dirmanager import DirManager, symlink_or_copy, \
     rmlink_or_rmtree
 from golem.task.localcomputer import LocalComputer
@@ -29,7 +29,7 @@ logging.getLogger("peewee").setLevel("INFO")
 
 
 # TODO: extract code common to this class and TestDockerBlenderTask
-# to a superclass
+# to a superclass. issue: G #2393
 
 @ci_skip
 class TestDockerDummyTask(TempDirFixture, DockerTestCase):
@@ -108,6 +108,7 @@ class TestDockerDummyTask(TempDirFixture, DockerTestCase):
         return task_def
 
     def _test_task(self) -> DummyTask:
+        DummyTask.VERIFICATION_QUEUE._reset()
         task_def = self._test_task_definition()
         node_name = "0123456789abcdef"
         dir_manager = DirManager(self.path)
@@ -121,17 +122,32 @@ class TestDockerDummyTask(TempDirFixture, DockerTestCase):
         task_id = task.header.task_id
         extra_data = task.query_extra_data(1.0)
         ctd = extra_data.ctd
-        ctd.deadline = timeout_to_deadline(timeout)
+        ctd['deadline'] = timeout_to_deadline(timeout)
 
         # Create the computing node
-        self.node = OptNode(datadir=self.path, use_docker_machine_manager=False)
+        self.node = Node(
+            datadir=self.path,
+            app_config=Mock(),
+            config_desc=ClientConfigDescriptor(),
+            use_docker_manager=False,
+        )
+        with mock.patch('golem.client.EthereumTransactionSystem'):
+            self.node.client = self.node._client_factory(Mock())
         self.node.client.start = Mock()
         self.node._run()
 
         ccd = ClientConfigDescriptor()
 
-        task_server = TaskServer(Mock(), ccd, Mock(), self.node.client,
-                                 use_docker_machine_manager=False)
+        with mock.patch(
+                "golem.network.concent.handlers_library"
+                ".HandlersLibrary"
+                ".register_handler"):
+            task_server = TaskServer(
+                node=Mock(),
+                config_desc=ccd,
+                client=self.node.client,
+                use_docker_manager=False
+            )
         task_server.task_keeper.task_headers[task_id] = task.header
         task_computer = task_server.task_computer
 
@@ -167,14 +183,14 @@ class TestDockerDummyTask(TempDirFixture, DockerTestCase):
                 makedirs(dest_dirname)
             shutil.copyfile(os.path.join(td.code_dir, res_file), dest_file)
 
-        def send_task_failed(self_, subtask_id, task_id, error_msg, *args):
+        def send_task_failed(_, __, ___, error_msg):
             self.error_msg = error_msg
 
         TaskServer.send_task_failed = send_task_failed
 
         # Start task computation
         task_computer.task_given(ctd)
-        result = task_computer.resource_given(ctd.task_id)
+        result = task_computer.resource_given(ctd['task_id'])
         self.assertTrue(result)
 
         # Thread for task computation should be created by now
@@ -225,42 +241,49 @@ class TestDockerDummyTask(TempDirFixture, DockerTestCase):
 
         return new_result
 
-    def test_dummy_real_task(self):
+    @mock.patch('apps.core.task.verifier.deadline_to_timeout')
+    def test_dummy_real_task(self, mock_dtt):
+        mock_dtt.return_value = 1.0
 
         task = self._test_task()
         ctd = task.query_extra_data(1.0).ctd
 
+        print(ctd)
+        print(type(ctd))
+
         computer = LocalComputer(
-            task,
-            self.tempdir,
-            Mock(),
-            Mock(),
-            lambda: ctd
+            root_path=self.tempdir,
+            success_callback=Mock(),
+            error_callback=Mock(),
+            compute_task_def=ctd,
+            resources=task.task_resources,
         )
 
         computer.run()
         computer.tt.join()
 
-        output = self._extract_results(computer, task, ctd.subtask_id)
+        output = self._extract_results(computer, task, ctd['subtask_id'])
 
         task.create_reference_data_for_task_validation()
 
         ## assert good results - should pass
         self.assertEqual(task.num_tasks_received, 0)
-        task.computation_finished(ctd.subtask_id, [output],
-                                  result_type=ResultType.FILES)
+        task.computation_finished(ctd['subtask_id'], [output],
+                                  result_type=ResultType.FILES,
+                                  verification_finished_=lambda: None)
 
-        is_subtask_verified = task.verify_subtask(ctd.subtask_id)
+        is_subtask_verified = task.verify_subtask(ctd['subtask_id'])
         self.assertTrue(is_subtask_verified)
         self.assertEqual(task.num_tasks_received, 1)
 
         ## assert bad results - should fail
         bad_output = path.join(path.dirname(output), "badfile.result")
         ctd = task.query_extra_data(10000.).ctd
-        task.computation_finished(ctd.subtask_id, [bad_output],
-                                  result_type=ResultType.FILES)
+        task.computation_finished(ctd['subtask_id'], [bad_output],
+                                  result_type=ResultType.FILES,
+                                  verification_finished_=lambda: None)
 
-        self.assertFalse(task.verify_subtask(ctd.subtask_id))
+        self.assertFalse(task.verify_subtask(ctd['subtask_id']))
         self.assertEqual(task.num_tasks_received, 1)
 
     def test_dummytask_TaskTester_should_pass(self):

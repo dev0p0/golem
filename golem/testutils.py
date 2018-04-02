@@ -1,18 +1,21 @@
 import logging
 import os
 import os.path
-import pycodestyle
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from time import sleep
-from unittest.mock import MagicMock
+
+import ethereum.keys
+import pycodestyle
 
 from golem.core.common import get_golem_path, is_windows, is_osx
 from golem.core.simpleenv import get_local_datadir
-from golem.ethereum import Client
-from golem.model import Database
+from golem.database import Database
+from golem.model import DB_MODELS, db, DB_FIELDS
+
+logger = logging.getLogger(__name__)
 
 
 class TempDirFixture(unittest.TestCase):
@@ -41,6 +44,10 @@ class TempDirFixture(unittest.TestCase):
     #         shutil.rmtree(cls.root_dir)
 
     def setUp(self):
+
+        # KeysAuth uses it. Default val (250k+) slows down the tests terribly
+        ethereum.keys.PBKDF2_CONSTANTS['c'] = 1
+
         prefix = self.id().rsplit('.', 1)[1]  # Use test method name
         self.tempdir = tempfile.mkdtemp(prefix=prefix, dir=self.root_dir)
         self.path = self.tempdir  # Alias for legacy tests
@@ -50,12 +57,16 @@ class TempDirFixture(unittest.TestCase):
 
     def tearDown(self):
         # Firstly kill Ethereum node to clean up after it later on.
-        # FIXME: This is temporary solution. Ethereum node should always be
-        #        the explicit dependency and users should close it correctly.
-        Client._kill_node()
         try:
             self.__remove_files()
-        except OSError:
+        except OSError as e:
+            logger.debug("%r", e, exc_info=True)
+            tree = ''
+            for path, dirs, files in os.walk(self.path):
+                tree += path + '\n'
+                for f in files:
+                    tree += f + '\n'
+            logger.error("Failed to remove files %r", tree)
             # Tie up loose ends.
             import gc
             gc.collect()
@@ -111,28 +122,20 @@ class DatabaseFixture(TempDirFixture):
 
     def setUp(self):
         super(DatabaseFixture, self).setUp()
-        self.database = Database(self.tempdir)
+        self.database = Database(db, fields=DB_FIELDS, models=DB_MODELS,
+                                 db_dir=self.tempdir)
 
     def tearDown(self):
         self.database.db.close()
         super(DatabaseFixture, self).tearDown()
 
 
-class TestGui(TempDirFixture):
+class TestWithClient(TempDirFixture):
 
     def setUp(self):
-        super(TestGui, self).setUp()
-        from gui.application import Gui
-        from gui.view.appmainwindow import AppMainWindow
-
-        self.logic = MagicMock()
-        self.gui = Gui(self.logic, AppMainWindow)
-
-    def tearDown(self):
-        super(TestGui, self).tearDown()
-        self.gui.app.exit(0)
-        self.gui.app.deleteLater()
-
+        super(TestWithClient, self).setUp()
+        self.client = unittest.mock.Mock()
+        self.client.datadir = os.path.join(self.path, "datadir")
 
 class PEP8MixIn(object):
     """A mix-in class that adds PEP-8 style conformance.
@@ -146,7 +149,6 @@ class PEP8MixIn(object):
     Afterwards your test case will perform conformance test on files mentioned
     in this attribute.
     """
-
 
     def test_conformance(self):
         """Test that we conform to PEP-8."""

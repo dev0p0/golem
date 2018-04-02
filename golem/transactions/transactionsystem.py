@@ -1,3 +1,5 @@
+from typing import List
+
 from golem.core.common import datetime_to_timestamp, to_unicode
 from golem.model import Payment, PaymentStatus, PaymentDetails
 
@@ -65,36 +67,24 @@ class TransactionSystem(object):
         incomes = self.incomes_keeper.get_list_of_all_incomes()
 
         def item(o):
-            status = PaymentStatus.confirmed if o.income.transaction \
+            status = PaymentStatus.confirmed if o.transaction \
                 else PaymentStatus.awaiting
 
             return {
-                "task": to_unicode(o.task),
                 "subtask": to_unicode(o.subtask),
                 "payer": to_unicode(o.sender_node),
                 "value": to_unicode(o.value),
                 "status": to_unicode(status.name),
-                "block_number": to_unicode(o.income.block_number),
-                "transaction": to_unicode(o.income.transaction),
+                "transaction": to_unicode(o.transaction),
                 "created": datetime_to_timestamp(o.created_date),
                 "modified": datetime_to_timestamp(o.modified_date)
             }
 
         return [item(income) for income in incomes]
 
-    def check_payments(self):
-        # TODO Some code from taskkeeper
-        # now = datetime.datetime.now()
-        # after_deadline = []
-        # for subtask_id, [task_id, task_date, deadline]
-        # in self.completed.items():
-        #     if deadline < now:
-        #         after_deadline.append(task_id)
-        #         del self.completed[subtask_id]
-        # return after_deadline
-
-        self.incomes_keeper.run_once()
-        return []
+    def get_nodes_with_overdue_payments(self) -> List[str]:
+        overdue_incomes = self.incomes_keeper.update_overdue_incomes()
+        return [x.sender_node for x in overdue_incomes]
 
     def sync(self) -> None:
         pass

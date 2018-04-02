@@ -1,4 +1,5 @@
-import mock
+import unittest.mock as mock
+
 from PIL import Image
 
 from apps.rendering.benchmark import renderingbenchmark
@@ -31,7 +32,7 @@ class TestBenchmark(TempDirFixture):
             f.write('notanimage,notanimageatall')
         with mock.patch('apps.rendering.benchmark.renderingbenchmark.logger') as m:
             self.assertFalse(self.benchmark.verify_img(filepath))
-            m.warning.assert_called_once_with(mock.ANY, exc_info=True)
+            m.error.assert_called_once()
 
     def test_verify_log(self):
         def verify_log(file_content):

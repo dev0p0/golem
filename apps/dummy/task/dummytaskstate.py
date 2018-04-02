@@ -47,6 +47,7 @@ class DummyTaskDefinition(TaskDefinition):
         TaskDefinition.__init__(self)
 
         self.options = DummyTaskOptions()
+        self.task_type = 'DUMMY'
 
         # subtask data
         self.shared_data_files = []
@@ -66,7 +67,7 @@ class DummyTaskDefinition(TaskDefinition):
         super().add_to_resources()
 
         # TODO create temp in task directory
-        # but for now TaskDefinition doesn't know root_path
+        # but for now TaskDefinition doesn't know root_path. Issue #2427
         # task_root_path = ""
         # self.tmp_dir = DirManager().get_task_temporary_dir(self.task_id, True)
 
@@ -83,8 +84,9 @@ class DummyTaskDefinition(TaskDefinition):
         data_path = os.path.join(self.tmp_dir, "data")
         data_file = list(self.shared_data_files)[0]
         if os.path.exists(data_path):
-            raise Exception("Error adding to resources: data path: {} exists"
-                            .format(data_path))
+            raise FileExistsError("Error adding to resources: "
+                                  "data path: {} exists."
+                                  .format(data_path))
 
         os.mkdir(data_path)
         symlink_or_copy(data_file,
@@ -92,7 +94,7 @@ class DummyTaskDefinition(TaskDefinition):
 
         self.resources = set(ls_R(self.tmp_dir))
 
-    # TODO maybe move it to the CoreTask?
+    # TODO maybe move it to the CoreTask? Issue #2428
     def set_defaults(self, defaults: DummyTaskDefaults):
         self.shared_data_files = deepcopy(defaults.shared_data_files)
         self.out_file_basename = defaults.out_file_basename

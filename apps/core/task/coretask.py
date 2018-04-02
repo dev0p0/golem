@@ -1,28 +1,29 @@
 import abc
-import copy
+import decimal
 import logging
 import os
 import uuid
 from enum import Enum
 from typing import Type
 
+import golem_messages.message
 from ethereum.utils import denoms
 
 from apps.core.task.coretaskstate import TaskDefinition, Options
-from apps.core.task.verificator import CoreVerificator, SubtaskVerificationState
+from apps.core.task.verifier import CoreVerifier, VerificationQueue
 from golem.core.common import HandleKeyError, timeout_to_deadline, to_unicode, \
     string_to_timeout
 from golem.core.compress import decompress
 from golem.core.fileshelper import outer_dir_path
 from golem.core.simpleserializer import CBORSerializer
 from golem.docker.environment import DockerEnvironment
-from golem.environments.environment import Environment
 from golem.network.p2p.node import Node
-from golem.resource.resource import prepare_delta_zip, TaskResourceHeader
+from golem.resource.dirmanager import DirManager
 from golem.task.taskbase import Task, TaskHeader, TaskBuilder, ResultType, \
-    ResourceType, ComputeTaskDef, TaskTypeInfo
+    TaskTypeInfo
 from golem.task.taskclient import TaskClient
 from golem.task.taskstate import SubtaskStatus
+from golem.verification.verifier import SubtaskVerificationState
 
 logger = logging.getLogger("apps.core")
 
@@ -50,12 +51,8 @@ class CoreTaskTypeInfo(TaskTypeInfo):
                  definition: 'Type[TaskDefinition]',
                  defaults: 'TaskDefaults',
                  options: Type[Options],
-                 builder_type: Type[TaskBuilder],
-                 dialog=None,
-                 dialog_controller=None):
+                 builder_type: Type[TaskBuilder]):
         super().__init__(name, definition, defaults, options, builder_type)
-        self.dialog = dialog
-        self.dialog_controller = dialog_controller
         self.output_formats = []
         self.output_file_ext = []
 
@@ -86,9 +83,9 @@ class CoreTaskTypeInfo(TaskTypeInfo):
 
 
 class CoreTask(Task):
-    VERIFICATOR_CLASS = CoreVerificator  # type: Type[CoreVerificator]
+    VERIFIER_CLASS = CoreVerifier  # type: Type[CoreVerifier]
+    VERIFICATION_QUEUE = VerificationQueue()
 
-    # TODO maybe @abstract @property?
     ENVIRONMENT_CLASS = None  # type: Type[Environment]
 
     handle_key_error = HandleKeyError(log_key_error)
@@ -112,10 +109,11 @@ class CoreTask(Task):
         """
 
         task_timeout = task_definition.full_task_timeout
-        deadline = timeout_to_deadline(task_timeout)
+        self._deadline = timeout_to_deadline(task_timeout)
 
         # resources stuff
-        self.task_resources = list(set(filter(os.path.isfile, task_definition.resources)))
+        self.task_resources = list(
+            set(filter(os.path.isfile, task_definition.resources)))
         if resource_size is None:
             self.resource_size = 0
             for resource in self.task_resources:
@@ -135,11 +133,12 @@ class CoreTask(Task):
             src_code = ""
 
         # docker_images stuff
-        docker_images = None
         if task_definition.docker_images:
-            docker_images = task_definition.docker_images
+            self.docker_images = task_definition.docker_images
         elif isinstance(self.environment, DockerEnvironment):
-            docker_images = self.environment.docker_images
+            self.docker_images = self.environment.docker_images
+        else:
+            self.docker_images = None
 
         th = TaskHeader(
             node_name=node_name,
@@ -149,12 +148,11 @@ class CoreTask(Task):
             task_owner_key_id=owner_key_id,
             environment=self.environment.get_id(),
             task_owner=Node(),
-            deadline=deadline,
+            deadline=self._deadline,
             subtask_timeout=task_definition.subtask_timeout,
             resource_size=self.resource_size,
             estimated_memory=task_definition.estimated_memory,
             max_price=task_definition.max_price,
-            docker_images=docker_images,
         )
 
         Task.__init__(self, th, src_code, task_definition)
@@ -177,17 +175,34 @@ class CoreTask(Task):
 
         self.res_files = {}
         self.tmp_dir = None
-        self.verificator = self.VERIFICATOR_CLASS()
         self.max_pending_client_results = max_pending_client_results
 
-    def is_docker_task(self):
-        return hasattr(self.header, 'docker_images') \
-               and self.header.docker_images \
-               and len(self.header.docker_images) > 0
+    @staticmethod
+    def create_task_id(public_key: bytes) -> str:
+        """
+        seeds top 48 bits from given public key as node in generated uuid1
 
-    def initialize(self, dir_manager):
-        self.tmp_dir = dir_manager.get_task_temporary_dir(self.header.task_id, create=True)
-        self.verificator.tmp_dir = self.tmp_dir
+        :param bytes public_key: `KeysAuth.public_key`
+        :returns: string uuid1 based on timestamp and given key
+        """
+        return str(uuid.uuid1(node=int.from_bytes(public_key[:6], 'big')))
+
+    def create_subtask_id(self) -> str:
+        """
+        seeds low 48 bits from task_id as node in generated uuid1
+
+        :returns: uuid1 based on timestamp and task_id
+        """
+        task_uuid = uuid.UUID(self.header.task_id)
+        return str(uuid.uuid1(node=task_uuid.node))
+
+    def is_docker_task(self):
+        return len(self.docker_images or ()) > 0
+
+    def initialize(self, dir_manager: DirManager) -> None:
+        dir_manager.clear_temporary(self.header.task_id)
+        self.tmp_dir = dir_manager.get_task_temporary_dir(self.header.task_id,
+                                                          create=True)
 
     def needs_computation(self):
         return (self.last_task != self.total_tasks) or (self.num_failed_subtasks > 0)
@@ -198,17 +213,38 @@ class CoreTask(Task):
     def computation_failed(self, subtask_id):
         self._mark_subtask_failed(subtask_id)
 
-    def computation_finished(self, subtask_id, task_result, result_type=ResultType.DATA):
+    def computation_finished(self, subtask_id, task_result,
+                             result_type=ResultType.DATA,
+                             verification_finished_=None):
         if not self.should_accept(subtask_id):
             logger.info("Not accepting results for {}".format(subtask_id))
             return
+        self.subtasks_given[subtask_id]['status'] = SubtaskStatus.verifying
         self.interpret_task_results(subtask_id, task_result, result_type)
         result_files = self.results.get(subtask_id)
-        ver_state = self.verificator.verify(subtask_id, self.subtasks_given.get(subtask_id),
-                                            result_files, self)
-        if ver_state == SubtaskVerificationState.VERIFIED:
-            self.accept_results(subtask_id, result_files)
-        # TODO Add support for different verification states
+
+        def verification_finished(subtask_id, verdict, result):
+            self.verification_finished(subtask_id, verdict, result)
+            verification_finished_()
+
+        self.VERIFICATION_QUEUE.submit(
+            self.VERIFIER_CLASS,
+            subtask_id,
+            self._deadline,
+            verification_finished,
+            subtask_info=self.subtasks_given[subtask_id],
+            results=result_files,
+            resources=self.task_resources,
+            reference_data=self.get_reference_data()
+        )
+
+    def get_reference_data(self):
+        return []
+
+    def verification_finished(self, subtask_id, verdict, result):
+        if verdict == SubtaskVerificationState.VERIFIED:
+            self.accept_results(subtask_id, result['extra_data']['results'])
+        # TODO Add support for different verification states. issue #2422
         else:
             self.computation_failed(subtask_id)
 
@@ -222,6 +258,7 @@ class CoreTask(Task):
             raise Exception("Subtask {} already accepted".format(subtask_id))
         if subtask.get("status", None) not in [SubtaskStatus.starting,
                                                SubtaskStatus.downloading,
+                                               SubtaskStatus.verifying,
                                                SubtaskStatus.resent,
                                                SubtaskStatus.finished,
                                                SubtaskStatus.failure,
@@ -248,7 +285,7 @@ class CoreTask(Task):
         return (self.total_tasks - self.last_task) + self.num_failed_subtasks
 
     def get_subtasks(self, part):
-        return []
+        return dict()
 
     def restart(self):
         for subtask_id in list(self.subtasks_given.keys()):
@@ -260,7 +297,9 @@ class CoreTask(Task):
         was_failure_before = subtask_info['status'] in [SubtaskStatus.failure,
                                                         SubtaskStatus.resent]
 
-        if SubtaskStatus.is_computed(subtask_info['status']):
+        if SubtaskStatus.is_active(subtask_info['status']):
+            # TODO Restarted tasks that were waiting for verification should
+            # cancel it. Issue #2423
             self._mark_subtask_failed(subtask_id)
         elif subtask_info['status'] == SubtaskStatus.finished:
             self._mark_subtask_failed(subtask_id)
@@ -278,24 +317,6 @@ class CoreTask(Task):
             return 0.0
         return self.num_tasks_received / self.total_tasks
 
-    def get_resources(self, resource_header, resource_type=ResourceType.ZIP, tmp_dir=None):
-
-        dir_name = self._get_resources_root_dir()
-        if tmp_dir is None:
-            tmp_dir = self.tmp_dir
-
-        if os.path.exists(dir_name):
-            if resource_type == ResourceType.ZIP:
-                return prepare_delta_zip(dir_name, resource_header, tmp_dir, self.task_resources)
-
-            elif resource_type == ResourceType.PARTS:
-                return TaskResourceHeader.build_parts_header_delta_from_chosen(resource_header,
-                                                                               dir_name,
-                                                                               self.res_files)
-            elif resource_type == ResourceType.HASHES:
-                return copy.copy(self.task_resources)
-
-        return None
 
     def update_task_state(self, task_state):
         pass
@@ -325,19 +346,20 @@ class CoreTask(Task):
             'progress': self.get_progress()
         }
 
-    def _new_compute_task_def(self, hash, extra_data, working_directory=".", perf_index=0):
-        ctd = ComputeTaskDef()
-        ctd.task_id = self.header.task_id
-        ctd.subtask_id = hash
-        ctd.extra_data = extra_data
-        ctd.short_description = self.short_extra_data_repr(extra_data)
-        ctd.src_code = self.src_code
-        ctd.performance = perf_index
-        ctd.working_directory = working_directory
-        ctd.docker_images = self.header.docker_images
-        ctd.deadline = timeout_to_deadline(self.header.subtask_timeout)
-        ctd.task_owner = self.header.task_owner
-        ctd.environment = self.header.environment
+    def _new_compute_task_def(self, subtask_id, extra_data,
+                              working_directory=".", perf_index=0):
+        ctd = golem_messages.message.ComputeTaskDef()
+        ctd['task_id'] = self.header.task_id
+        ctd['subtask_id'] = subtask_id
+        ctd['extra_data'] = extra_data
+        ctd['short_description'] = self.short_extra_data_repr(extra_data)
+        ctd['src_code'] = self.src_code
+        ctd['performance'] = perf_index
+        ctd['working_directory'] = working_directory
+        if self.docker_images:
+            ctd['docker_images'] = [di.to_dict() for di in self.docker_images]
+        ctd['deadline'] = min(timeout_to_deadline(self.header.subtask_timeout),
+                              self.header.deadline)
 
         return ctd
 
@@ -358,19 +380,22 @@ class CoreTask(Task):
         """
         self.stdout[subtask_id] = ""
         self.stderr[subtask_id] = ""
-        tr_files = self.load_task_results(task_results, result_type, subtask_id)
-        self.results[subtask_id] = self.filter_task_results(tr_files, subtask_id)
+        tr_files = self.load_task_results(
+            task_results, result_type, subtask_id)
+        self.results[subtask_id] = self.filter_task_results(
+            tr_files, subtask_id)
         if sort:
             self.results[subtask_id].sort()
 
     @handle_key_error
     def result_incoming(self, subtask_id):
-        self.counting_nodes[self.subtasks_given[subtask_id]['node_id']].finish()
+        self.counting_nodes[self.subtasks_given[
+            subtask_id]['node_id']].finish()
         self.subtasks_given[subtask_id]['status'] = SubtaskStatus.downloading
 
-    # TODO why is it here and not in the Task?
+    # TODO why is it here and not in the Task? Issue #1355
     @abc.abstractmethod
-    def query_extra_data_for_test_task(self) -> ComputeTaskDef:
+    def query_extra_data_for_test_task(self) -> golem_messages.message.ComputeTaskDef:  # noqa
         pass  # Implement in derived methods
 
     def load_task_results(self, task_result, result_type: int, subtask_id):
@@ -390,8 +415,12 @@ class CoreTask(Task):
         elif result_type == ResultType.FILES:
             return task_result
         else:
-            logger.error("Task result type not supported {}".format(result_type))
-            self.stderr[subtask_id] = "[GOLEM] Task result {} not supported".format(result_type)
+            logger.error(
+                "Task result type not supported %r",
+                result_type,
+            )
+            self.stderr[subtask_id] = "[GOLEM] Task result {} not supported" \
+                .format(result_type)
             return []
 
     def filter_task_results(self, task_results, subtask_id, log_ext=".log", err_log_ext="err.log"):
@@ -454,7 +483,8 @@ class CoreTask(Task):
     @handle_key_error
     def _mark_subtask_failed(self, subtask_id):
         self.subtasks_given[subtask_id]['status'] = SubtaskStatus.failure
-        self.counting_nodes[self.subtasks_given[subtask_id]['node_id']].reject()
+        self.counting_nodes[self.subtasks_given[
+            subtask_id]['node_id']].reject()
         self.num_failed_subtasks += 1
 
     def _unpack_task_result(self, trp, output_dir):
@@ -462,6 +492,9 @@ class CoreTask(Task):
         with open(os.path.join(output_dir, tr[0]), "wb") as fh:
             fh.write(decompress(tr[1]))
         return os.path.join(output_dir, tr[0])
+
+    def get_resources(self):
+        return self.task_resources
 
     def _get_resources_root_dir(self):
         task_resources = list(self.task_resources)
@@ -476,18 +509,17 @@ class CoreTask(Task):
         if client.rejected():
             return AcceptClientVerdict.REJECTED
         elif finishing >= max_finishing or \
-                                client.started() - finishing >= max_finishing:
+                client.started() - finishing >= max_finishing:
             return AcceptClientVerdict.SHOULD_WAIT
 
         client.start()
         return AcceptClientVerdict.ACCEPTED
 
 
-# TODO test it
-# some of the tests are in the test_luxrendertask.py
 def accepting(query_extra_data_func):
     """
-    A decorator for query_extra_data - it wraps the function with verification code
+    A function decorator which wraps given function with a verification code.
+
     :param query_extra_data_func: query_extra_data function from Task
     :return:
     """
@@ -502,11 +534,12 @@ def accepting(query_extra_data_func):
 
             should_wait = verdict == AcceptClientVerdict.SHOULD_WAIT
             if should_wait:
-                logger.warning("Waiting for results from {}"
-                               .format(node_name))
+                logger.warning("Waiting for results from %s on %s", node_name,
+                               self.task_definition.task_id)
             else:
-                logger.warning("Client {} banned from this task"
-                               .format(node_name))
+                logger.warning("Client %s has failed on subtask within task %s"
+                               " and is banned from it", node_name,
+                               self.task_definition.task_id)
 
             return self.ExtraData(should_wait=should_wait)
 
@@ -514,7 +547,8 @@ def accepting(query_extra_data_func):
             logger.error("Task already computed")
             return self.ExtraData()
 
-        return query_extra_data_func(self, perf_index, num_cores, node_id, node_name)
+        return query_extra_data_func(self, perf_index, num_cores,
+                                     node_id, node_name)
 
     return accepting_qed
 
@@ -522,7 +556,7 @@ def accepting(query_extra_data_func):
 class CoreTaskBuilder(TaskBuilder):
     TASK_CLASS = CoreTask
 
-    # FIXME get the root path from dir_manager
+    # FIXME get the root path from dir_manager. Issue #2449
     def __init__(self, node_name, task_definition, root_path, dir_manager):
         super(CoreTaskBuilder, self).__init__()
         self.task_definition = task_definition
@@ -548,14 +582,10 @@ class CoreTaskBuilder(TaskBuilder):
     def build_minimal_definition(cls, task_type: CoreTaskTypeInfo, dictionary):
         definition = task_type.definition()
         definition.options = task_type.options()
-        definition.task_id = dictionary.get('id', str(uuid.uuid4()))
         definition.task_type = task_type.name
         definition.resources = set(dictionary['resources'])
         definition.total_subtasks = int(dictionary['subtasks'])
         definition.main_program_file = task_type.defaults.main_program_file
-
-        # FIXME: Backward compatibility only. Remove after upgrading GUI.
-        definition.legacy = dictionary.get('legacy', False)
 
         return definition
 
@@ -574,7 +604,8 @@ class CoreTaskBuilder(TaskBuilder):
     def build_full_definition(cls, task_type: CoreTaskTypeInfo, dictionary):
         definition = cls.build_minimal_definition(task_type, dictionary)
         definition.task_name = dictionary['name']
-        definition.max_price = float(dictionary['bid']) * denoms.ether
+        definition.max_price = \
+            int(decimal.Decimal(dictionary['bid']) * denoms.ether)
 
         definition.full_task_timeout = string_to_timeout(
             dictionary['timeout'])
@@ -586,7 +617,7 @@ class CoreTaskBuilder(TaskBuilder):
 
     # TODO: Backward compatibility only. The rendering tasks should
     # move to overriding their own TaskDefinitions instead of
-    # overriding `build_dictionary`
+    # overriding `build_dictionary. Issue #2424`
     @staticmethod
     def build_dictionary(definition: TaskDefinition) -> dict:
         return definition.to_dict()
@@ -595,8 +626,50 @@ class CoreTaskBuilder(TaskBuilder):
     def get_output_path(cls, dictionary, definition):
         options = dictionary['options']
 
-        # FIXME: Backward compatibility only. Remove after upgrading GUI.
-        if definition.legacy:
-            return options['output_path']
+        absolute_path = cls.get_nonexistant_path(
+            options['output_path'],
+            definition.task_name,
+            options.get('format', ''))
 
-        return os.path.join(options['output_path'], definition.task_name)
+        return absolute_path
+
+    @classmethod
+    def get_nonexistant_path(cls, path, name, extension=""):
+        """
+        Prevent overwriting with incremental filename
+        @ref https://stackoverflow.com/a/43167607/1763249
+
+        Example
+        --------
+
+        >>> get_nonexistant_path('/documents/golem/', 'task1', 'png')
+
+        # if path is not exist
+        '/documents/golem/task1'
+
+        # or if exist
+        '/documents/golem/task 1(1)'
+
+        # or even if still exist
+        '/documents/golem/task 1(2)'
+
+        ...
+        """
+        fname_path = os.path.join(path, name)
+
+        if extension:
+            extension = "." + extension
+
+        path_with_ext = os.path.join(path, name + extension)
+
+        if not os.path.exists(path_with_ext):
+            return fname_path
+
+        i = 1
+        new_fname = "{}({})".format(fname_path, i)
+
+        while os.path.exists(new_fname + extension):
+            i += 1
+            new_fname = "{}({})".format(fname_path, i)
+
+        return new_fname

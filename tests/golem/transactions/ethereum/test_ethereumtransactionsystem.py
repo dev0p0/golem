@@ -1,5 +1,6 @@
-import mock
-from mock import patch, MagicMock
+from unittest.mock import patch, Mock, ANY, PropertyMock
+
+import golem_sci
 
 from golem import testutils
 from golem.tools.assertlogs import LogTestCase
@@ -18,99 +19,205 @@ class TestEthereumTransactionSystem(TestWithDatabase, LogTestCase,
     def test_init(self):
         e = EthereumTransactionSystem(self.tempdir, PRIV_KEY)
         self.assertIsInstance(e, EthereumTransactionSystem)
-        assert type(e.get_payment_address()) is str
+        assert isinstance(e.get_payment_address(), str)
+        e.stop()
 
     def test_invalid_private_key(self):
         with self.assertRaises(ValueError):
             EthereumTransactionSystem(self.tempdir, "not a private key")
 
-    @mock.patch(
-        'golem.transactions.ethereum.ethereumtransactionsystem.'
-        'EthereumTransactionSystem.get_payment_address',
-        new_callable=mock.PropertyMock)
-    def test_invalid_eth_adress_construction(self, mock_get_payment_address):
-        mock_get_payment_address().return_value = None
-
-        with self.assertRaisesRegexp(ValueError,
-                                     "Invalid Ethereum address constructed"):
-            EthereumTransactionSystem(self.tempdir, PRIV_KEY)
-
-    @patch('golem.ethereum.paymentprocessor.PaymentProcessor.start')
-    @patch('golem.transactions.ethereum.ethereumtransactionsystem.sleep')
-    def test_sync(self, sleep, *_):
-        switch_value = [True]
-
-        def false():
-            return False
-
-        def switch(*_):
-            switch_value[0] = not switch_value[0]
-            return not switch_value[0]
-
-        def error(*_):
-            raise Exception
-
-        e = EthereumTransactionSystem(self.tempdir, PRIV_KEY)
-
-        sleep.call_count = 0
-        with patch(
-                'golem.ethereum.paymentprocessor.PaymentProcessor.is_synchronized',
-                side_effect=false):
-            e.sync()
-            assert sleep.call_count == 1
-
-        sleep.call_count = 0
-        with patch(
-                'golem.ethereum.paymentprocessor.PaymentProcessor.is_synchronized',
-                side_effect=switch):
-            e.sync()
-            assert sleep.call_count == 2
-
-        sleep.call_count = 0
-        with patch(
-                'golem.ethereum.paymentprocessor.PaymentProcessor.is_synchronized',
-                side_effect=error):
-            e.sync()
-            assert sleep.call_count == 0
-
     def test_get_balance(self):
         e = EthereumTransactionSystem(self.tempdir, PRIV_KEY)
-        assert e.get_balance() == (None, None, None)
+        assert e.get_balance() == (None, None, None, None, None)
+        e.stop()
 
-    @mock.patch('golem.transactions.service.Service.running',
-                new_callable=mock.PropertyMock)
+    @patch('golem.core.service.LoopingCallService.running',
+           new_callable=PropertyMock)
     def test_stop(self, mock_is_service_running):
         pkg = 'golem.ethereum.'
+        new_sci_method_name = \
+            'golem.transactions.ethereum.ethereumtransactionsystem.new_sci'
 
         def _init(self, *args, **kwargs):
             self.rpcport = 65001
             self._NodeProcess__ps = None
-            self.web3 = MagicMock()
+            self.web3 = Mock()
 
         with patch('twisted.internet.task.LoopingCall.start'), \
-            patch('twisted.internet.task.LoopingCall.stop'), \
-            patch(pkg + 'node.NodeProcess.start'), \
-            patch(pkg + 'node.NodeProcess.stop'), \
-            patch(pkg + 'node.NodeProcess.__init__', _init), \
-            patch('web3.providers.rpc.HTTPProvider.__init__', _init):
+                patch('twisted.internet.task.LoopingCall.stop'), \
+                patch(new_sci_method_name), \
+                patch(pkg + 'node.NodeProcess.start'), \
+                patch(pkg + 'paymentprocessor.GNTConverter'), \
+                patch(pkg + 'node.NodeProcess.stop'):
 
             mock_is_service_running.return_value = False
             e = EthereumTransactionSystem(self.tempdir, PRIV_KEY)
-            assert e.incomes_keeper.processor. \
-                _loopingCall.start.called
-            assert e.incomes_keeper.processor \
-                ._PaymentProcessor__client.node.start.called
+            assert e.payment_processor._loopingCall.start.called
+            assert e._node.start.called
 
             mock_is_service_running.return_value = False
             e.stop()
-            assert not e.incomes_keeper.processor. \
-                _PaymentProcessor__client.node.stop.called
-            assert not e.incomes_keeper.processor. \
-                _loopingCall.stop.called
+            assert e._node.stop.called
+            assert not e.payment_processor._loopingCall.stop.called
 
             mock_is_service_running.return_value = True
             e.stop()
-            assert e.incomes_keeper.processor. \
-                _PaymentProcessor__client.node is None
-            assert e.incomes_keeper.processor. \
-                _loopingCall.stop.called
+            assert e.payment_processor._loopingCall.stop.called
+
+    @patch('golem.transactions.ethereum.ethereumtransactionsystem.NodeProcess',
+           Mock())
+    @patch('golem.transactions.ethereum.ethereumtransactionsystem.new_sci')
+    @patch('golem.transactions.ethereum.ethereumtransactionsystem.'
+           'PaymentProcessor')
+    def test_mainnet_flag(self, pp, new_sci):
+        EthereumTransactionSystem(self.tempdir, PRIV_KEY, False)
+        new_sci.assert_called_once_with(
+            ANY,
+            ANY,
+            ANY,
+            golem_sci.chains.RINKEBY,
+        )
+        pp.assert_called_once_with(sci=ANY, faucet=True)
+
+        new_sci.reset_mock()
+        pp.reset_mock()
+
+        EthereumTransactionSystem(self.tempdir, PRIV_KEY, True)
+        new_sci.assert_called_once_with(
+            ANY,
+            ANY,
+            ANY,
+            golem_sci.chains.MAINNET,
+        )
+        pp.assert_called_once_with(sci=ANY, faucet=False)
+
+    @patch('golem.transactions.ethereum.ethereumtransactionsystem.NodeProcess',
+           Mock())
+    @patch('golem.transactions.ethereum.ethereumtransactionsystem.new_sci')
+    def test_get_withdraw_gas_cost(self, new_sci):
+        sci = Mock()
+        sci.GAS_PRICE = 0
+        sci.GAS_PER_PAYMENT = 0
+        sci.GAS_BATCH_PAYMENT_BASE = 0
+        sci.get_gate_address.return_value = None
+        sci.GAS_GNT_TRANSFER = 222
+        sci.GAS_WITHDRAW = 555
+        gas_price = 123
+        sci.get_current_gas_price.return_value = gas_price
+        new_sci.return_value = sci
+        eth_balance = 400
+        gnt_balance = 100
+        gntb_balance = 200
+        sci.get_eth_balance.return_value = eth_balance
+        sci.get_gnt_balance.return_value = gnt_balance
+        sci.get_gntb_balance.return_value = gntb_balance
+
+        ets = EthereumTransactionSystem(self.tempdir, PRIV_KEY)
+
+        cost = ets.get_withdraw_gas_cost(eth_balance, 'ETH')
+        assert cost == 21000 * gas_price
+
+        cost = ets.get_withdraw_gas_cost(gnt_balance, 'GNT')
+        assert cost == sci.GAS_GNT_TRANSFER * gas_price
+
+        cost = ets.get_withdraw_gas_cost(gntb_balance, 'GNT')
+        assert cost == sci.GAS_WITHDRAW * gas_price
+
+        cost = ets.get_withdraw_gas_cost(gntb_balance + gnt_balance, 'GNT')
+        assert cost == (sci.GAS_GNT_TRANSFER + sci.GAS_WITHDRAW) * gas_price
+
+    @patch('golem.transactions.ethereum.ethereumtransactionsystem.NodeProcess',
+           Mock())
+    @patch('golem.transactions.ethereum.ethereumtransactionsystem.new_sci')
+    def test_withdraw(self, new_sci):
+        sci = Mock()
+        sci.GAS_PRICE = 0
+        sci.GAS_PER_PAYMENT = 0
+        sci.GAS_BATCH_PAYMENT_BASE = 0
+        sci.get_gate_address.return_value = None
+        new_sci.return_value = sci
+        eth_balance = 400
+        gnt_balance = 100
+        gntb_balance = 200
+        sci.get_eth_balance.return_value = eth_balance
+        sci.get_gnt_balance.return_value = gnt_balance
+        sci.get_gntb_balance.return_value = gntb_balance
+        eth_tx = '0xee'
+        gnt_tx = '0xbad'
+        gntb_tx = '0xfad'
+        sci.transfer_eth.return_value = eth_tx
+        sci.transfer_gnt.return_value = gnt_tx
+        sci.convert_gntb_to_gnt.return_value = gntb_tx
+        destination = '0xdead'
+
+        ets = EthereumTransactionSystem(self.tempdir, PRIV_KEY)
+
+        # Unknown currency
+        with self.assertRaises(ValueError):
+            ets.withdraw(1, destination, 'asd')
+
+        # Not enough GNT
+        with self.assertRaises(ValueError):
+            ets.withdraw(gnt_balance + gntb_balance + 1, destination, 'GNT')
+
+        # Not enough ETH
+        with self.assertRaises(ValueError):
+            ets.withdraw(eth_balance + 1, destination, 'ETH')
+
+        # Enough GNT
+        res = ets.withdraw(gnt_balance - 1, destination, 'GNT')
+        assert res == [gnt_tx]
+        sci.transfer_gnt.assert_called_once_with(destination, gnt_balance - 1)
+        sci.reset_mock()
+
+        # Enough GNTB
+        res = ets.withdraw(gntb_balance - 1, destination, 'GNT')
+        assert res == [gntb_tx]
+        sci.convert_gntb_to_gnt.assert_called_once_with(
+            destination,
+            gntb_balance - 1,
+        )
+        sci.reset_mock()
+
+        # Enough total GNT
+        res = ets.withdraw(gnt_balance + gntb_balance - 1, destination, 'GNT')
+        assert res == [gnt_tx, gntb_tx]
+        sci.transfer_gnt.assert_called_once_with(destination, gnt_balance)
+        sci.convert_gntb_to_gnt.assert_called_once_with(
+            destination,
+            gntb_balance - 1,
+        )
+        sci.reset_mock()
+
+        # Enough ETH
+        res = ets.withdraw(eth_balance - 1, destination, 'ETH')
+        assert res == [eth_tx]
+        sci.transfer_eth.assert_called_once_with(destination, eth_balance - 1)
+        sci.reset_mock()
+
+        # Enough ETH with lock
+        res = ets.withdraw(eth_balance - 3, destination, 'ETH', 2)
+        assert res == [eth_tx]
+        sci.transfer_eth.assert_called_once_with(destination, eth_balance - 3)
+        sci.reset_mock()
+
+        # Not enough ETH with lock
+        with self.assertRaises(ValueError):
+            ets.withdraw(eth_balance - 3, destination, 'ETH', 4)
+        sci.reset_mock()
+
+        # Enough GNT with lock
+        res = ets.withdraw(gnt_balance + gntb_balance - 1, destination, 'GNT',
+                           1)
+        assert res == [gnt_tx, gntb_tx]
+        sci.transfer_gnt.assert_called_once_with(destination, gnt_balance)
+        sci.convert_gntb_to_gnt.assert_called_once_with(
+            destination,
+            gntb_balance - 1,
+        )
+        sci.reset_mock()
+
+        # Not enough GNT with lock
+        with self.assertRaises(ValueError):
+            ets.withdraw(gnt_balance + gntb_balance - 1, destination, 'GNT', 2)
+        sci.reset_mock()

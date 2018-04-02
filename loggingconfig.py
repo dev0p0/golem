@@ -41,28 +41,65 @@ LOGGING = {
             'level': 'INFO',
             'formatter': 'date',
             # suffix is substituted in golem.core.common.config_logging()
-            'filename': '%(datadir)slogs/golem%(suffix)s.log',
+            'filename': '%(logdir)s/golem%(suffix)s.log',
             'when': 'D',
             'interval': 1,
             'backupCount': 5,
             'encoding': 'utf-8',
         },
+        'error-file': {
+            'class': 'logging.FileHandler',
+            'level': 'WARNING',
+            'formatter': 'date',
+            # suffix is substituted in golem.core.common.config_logging()
+            'filename': '%(logdir)s/golem%(suffix)s.error.log',
+            'encoding': 'utf-8',
+        },
+        'sentry': {
+            'level': 'ERROR',
+            'class': 'golem.tools.customloggers.SwitchedSentryHandler',
+            'dsn': 'https://cdf4218c9dd24aa6adeb76ad0c990c9b:e6922bfaff9f49ccaa22ae4e406354aa@talkback.golem.network/2'  # noqa pylint: disable=line-too-long
+        },
     },
     'root': {
         'level': 'WARNING',
-        'handlers': ['console', 'file', ],
+        'handlers': ['console', 'file', 'error-file', 'sentry'],
         'filters': [],
     },
     'loggers': {
+        'golemapp': {
+            'level': 'INFO',
+            'propagate': True,
+        },
         'golem': {
             'level': 'WARNING',
             'propagate': True,
         },
-        'golem.version': {
+        'golem.client': {
+            'level': 'INFO',
+            'propagate': True,
+        },
+        'golem.core.hardware': {
+            'level': 'INFO',
+            'propagate': True,
+        },
+        'golem.core.keysauth': {
+            'level': 'INFO',
+            'propagate': True,
+        },
+        'golem.db': {
+            'level': 'INFO',
+            'propagate': True,
+        },
+        'golem.docker': {
             'level': 'INFO',
             'propagate': True,
         },
         'golem.pay': {
+            'level': 'INFO',
+            'propagate': True,
+        },
+        'golem.gnt_converter': {
             'level': 'INFO',
             'propagate': True,
         },
@@ -74,8 +111,24 @@ LOGGING = {
             'level': 'INFO',
             'propagate': True,
         },
-        'twisted': {
+        'golem.rpc.cert': {
             'level': 'INFO',
+            'propagate': True,
+        },
+        'golem.resources': {
+            'level': 'INFO',
+            'propagate': True,
+        },
+        'golem.task': {
+            'level': 'INFO',
+            'propagate': True,
+        },
+        'golem.token': {
+            'level': 'INFO',
+            'propagate': True,
+        },
+        'twisted': {
+            'level': 'WARNING',
             'propagate': True,
         },
         'golem.network': {'propagate': True},

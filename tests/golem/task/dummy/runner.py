@@ -6,24 +6,40 @@ difficulty is configurable, see comments in DummyTaskParameters.
 import atexit
 import logging
 import os
+from os import path
+import pathlib
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-from os import path
+from unittest import mock
 from threading import Thread
 
+from ethereum.utils import denoms
 from twisted.internet import reactor
 
+from golem.appconfig import AppConfig
+from golem.clientconfigdescriptor import ClientConfigDescriptor
+from golem.database import Database
 from golem.environments.environment import Environment
 from golem.resource.dirmanager import DirManager
+from golem.model import db, DB_FIELDS, DB_MODELS
 from golem.network.transport.tcpnetwork import SocketAddress
 from tests.golem.task.dummy.task import DummyTask, DummyTaskParameters
 
 REQUESTING_NODE_KIND = "requestor"
 COMPUTING_NODE_KIND = "computer"
+LOGGING_DICT = {
+    'handlers': {
+        'console': {
+            'formatter': 'date'
+        }
+    }
+}
+
+logger = logging.getLogger(__name__)
 
 
 def format_msg(kind, pid, msg):
@@ -48,11 +64,44 @@ def create_client(datadir):
     pystun.get_ip_info = override_ip_info
 
     from golem.client import Client
-    return Client(datadir=datadir,
-                  use_monitor=False,
-                  transaction_system=False,
-                  connect_to_known_hosts=False,
-                  use_docker_machine_manager=False)
+    app_config = AppConfig.load_config(datadir)
+    config_desc = ClientConfigDescriptor()
+    config_desc.init_from_app_config(app_config)
+    config_desc.key_difficulty = 0
+    config_desc.use_upnp = False
+
+    from golem.core.keysauth import KeysAuth
+    with mock.patch.dict('ethereum.keys.PBKDF2_CONSTANTS', {'c': 1}):
+        keys_auth = KeysAuth(
+            datadir=datadir,
+            private_key_name='priv_key',
+            password='password',
+            difficulty=config_desc.key_difficulty,
+        )
+
+    database = Database(
+        db, fields=DB_FIELDS, models=DB_MODELS, db_dir=datadir)
+
+    with mock.patch('golem.transactions.ethereum.ethereumtransactionsystem.'
+                    'PaymentProcessor') as pp:
+        _configure_mock_payment_processor(pp.return_value)
+        return Client(datadir=datadir,
+                      app_config=app_config,
+                      config_desc=config_desc,
+                      keys_auth=keys_auth,
+                      database=database,
+                      use_monitor=False,
+                      connect_to_known_hosts=False,
+                      use_docker_manager=False)
+
+
+def _configure_mock_payment_processor(pp):
+    pp.ETH_BATCH_PAYMENT_BASE = 0.01 * denoms.ether
+    pp.ETH_PER_PAYMENT = 0.001 * denoms.ether
+    pp.gnt_balance.return_value = 5000 * denoms.ether, time.time()
+    pp.eth_balance.return_value = 300 * denoms.ether, time.time()
+    pp._eth_available.return_value = 5000 * denoms.ether
+    pp._gnt_available.return_value = 3000 * denoms.ether
 
 
 def run_requesting_node(datadir, num_subtasks=3):
@@ -72,7 +121,11 @@ def run_requesting_node(datadir, num_subtasks=3):
 
     start_time = time.time()
     report("Starting in {}".format(datadir))
+    from golem.core.common import config_logging
+    with mock.patch.dict('loggingconfig.LOGGING', LOGGING_DICT):
+        config_logging(datadir=datadir, loglevel="DEBUG")
     client = create_client(datadir)
+    client.are_terms_accepted = lambda: True
     client.start()
     report("Started in {:.1f} s".format(time.time() - start_time))
 
@@ -115,7 +168,11 @@ def run_computing_node(datadir, peer_address, fail_after=None):
 
     start_time = time.time()
     report("Starting in {}".format(datadir))
+    from golem.core.common import config_logging
+    with mock.patch.dict('loggingconfig.LOGGING', LOGGING_DICT):
+        config_logging(datadir=datadir, loglevel="DEBUG")
     client = create_client(datadir)
+    client.are_terms_accepted = lambda: True
     client.start()
     client.task_server.task_computer.support_direct_computation = True
     report("Started in {:.1f} s".format(time.time() - start_time))
@@ -170,6 +227,8 @@ def run_simulation(num_computing_nodes=2, num_subtasks=3, timeout=120,
 
     # Start the requesting node in a separate process
     reqdir = path.join(datadir, REQUESTING_NODE_KIND)
+    reqdir_path = pathlib.Path(reqdir)
+    (reqdir_path / 'logs').mkdir(parents=True)
     requesting_proc = subprocess.Popen(
         [sys.executable, "-u", __file__, REQUESTING_NODE_KIND, reqdir,
          str(num_subtasks)],
@@ -179,7 +238,7 @@ def run_simulation(num_computing_nodes=2, num_subtasks=3, timeout=120,
 
     # Scan the requesting node's stdout for the address
     address_re = re.compile(".+REQUESTOR.+Listening on (.+)")
-    while True:
+    while requesting_proc.poll() is None:
         line = requesting_proc.stdout.readline().strip()
         if line:
             line = line.decode('utf-8')
@@ -188,6 +247,11 @@ def run_simulation(num_computing_nodes=2, num_subtasks=3, timeout=120,
             if m:
                 requestor_address = m.group(1)
                 break
+
+    if requesting_proc.poll() is not None:
+        logger.error("Requestor proc not started")
+        shutil.rmtree(datadir)
+        return "ERROR"
 
     # Start computing nodes in a separate processes
     computing_procs = []
@@ -256,6 +320,8 @@ def run_simulation(num_computing_nodes=2, num_subtasks=3, timeout=120,
 
         time.sleep(1)
 
+        shutil.rmtree(datadir)
+
 
 def dispatch(args):
     if len(args) == 4 and args[1] == REQUESTING_NODE_KIND:
@@ -269,7 +335,8 @@ def dispatch(args):
         # third arg is the address to connect to,
         # forth arg is the timeout (optional).
         fail_after = float(args[4]) if len(args) == 5 else None
-        run_computing_node(args[2], SocketAddress.parse(args[3]), fail_after=fail_after)
+        run_computing_node(args[2], SocketAddress.parse(args[3]),
+                           fail_after=fail_after)
     elif len(args) == 1:
         # I'm the main script, run simulation
         error_msg = run_simulation(num_computing_nodes=2, num_subtasks=4,

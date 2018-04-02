@@ -26,10 +26,10 @@ class TestDockerEnvironment(DockerTestCase):
             DockerEnvironmentMock(additional_images=["aaa"])
 
         de = DockerEnvironmentMock(additional_images=[
-            DockerImage("golemfactory/blender", tag="1.3")])
+            DockerImage("golemfactory/blender", tag="1.4")])
         self.assertTrue(de.check_support())
-        self.assertTrue(
-            de.description().startswith('Default environment for generic tasks without any additional requirements.'))
+        self.assertIn('Default environment for generic tasks without any'
+                      ' additional requirements.', de.description())
         self.assertTrue(de.check_docker_images())
 
     def test_blender_docker_env(self):
@@ -39,3 +39,4 @@ class TestDockerEnvironment(DockerTestCase):
 
         image_available = any(img.is_available() for img in env.docker_images)
         self.assertEqual(image_available, env.check_support().is_ok())
+        self.assertIn('Blender (www.blender.org)', env.description())

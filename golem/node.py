@@ -1,64 +1,253 @@
-"""Compute Node"""
+import functools
+import logging
+import time
+from typing import List, Optional, Callable, Any
 
-import click
+from twisted.internet import threads
+from twisted.internet.defer import gatherResults, Deferred
 
 from apps.appsmanager import AppsManager
+from golem.appconfig import AppConfig
 from golem.client import Client
-from golem.core.async import async_callback
-from golem.core.common import to_unicode
-from golem.network.transport.tcpnetwork import SocketAddress, AddressValueError
-from golem.rpc.mapping.core import CORE_METHOD_MAP
-from golem.rpc.session import object_method_map, Session
+from golem.clientconfigdescriptor import ClientConfigDescriptor
+from golem.core.deferred import chain_function
+from golem.core.keysauth import KeysAuth, WrongPassword
+from golem.core.async import async_run, AsyncRequest
+from golem.core.variables import PRIVATE_KEY
+from golem.database import Database
+from golem.docker.manager import DockerManager
+from golem.model import DB_MODELS, db, DB_FIELDS
+from golem.network.transport.tcpnetwork_helpers import SocketAddress
+from golem.report import StatusPublisher, Component, Stage
+from golem.rpc.mapping.rpcmethodnames import CORE_METHOD_MAP, NODE_METHOD_MAP
+from golem.rpc.router import CrossbarRouter
+from golem.rpc.session import object_method_map, Session, Publisher
+from golem.terms import TermsOfUse
+
+logger = logging.getLogger("app")
 
 
-class Node(object):
+# pylint: disable=too-many-instance-attributes
+class Node(object):  # pylint: disable=too-few-public-methods
     """ Simple Golem Node connecting console user interface with Client
     :type client golem.client.Client:
     """
 
-    def __init__(self, datadir=None, peers=None, transaction_system=False,
-                 use_monitor=False, use_docker_machine_manager=True,
-                 geth_port=None, **config_overrides):
+    def __init__(self,  # noqa pylint: disable=too-many-arguments
+                 datadir: str,
+                 app_config: AppConfig,
+                 config_desc: ClientConfigDescriptor,
+                 peers: Optional[List[SocketAddress]] = None,
+                 use_monitor: bool = False,
+                 use_concent: bool = False,
+                 mainnet: bool = False,
+                 use_docker_manager: bool = True,
+                 start_geth: bool = False,
+                 start_geth_port: Optional[int] = None,
+                 geth_address: Optional[str] = None,
+                 password: Optional[str] = None) -> None:
 
-        self.client = Client(
-            datadir=datadir,
-            transaction_system=transaction_system,
-            use_docker_machine_manager=use_docker_machine_manager,
-            use_monitor=use_monitor,
-            geth_port=geth_port,
-            **config_overrides
-        )
-
-        self.rpc_router = None
-        self.rpc_session = None
-
-        self._peers = peers or []
-        self._apps_manager = None
-
-        import logging
-        self.logger = logging.getLogger("app")
-
-    def run(self, use_rpc=False):
+        # DO NOT MAKE THIS IMPORT GLOBAL
+        # otherwise, reactor will install global signal handlers on import
+        # and will prevent the IOCP / kqueue reactors from being installed.
         from twisted.internet import reactor
 
+        self._reactor = reactor
+        self._config_desc = config_desc
+        self._mainnet = mainnet
+        self._datadir = datadir
+        self._use_docker_manager = use_docker_manager
+
+        self._keys_auth: Optional[KeysAuth] = None
+
+        self.rpc_router: Optional[CrossbarRouter] = None
+        self.rpc_session: Optional[Session] = None
+        self._rpc_publisher: Optional[Publisher] = None
+
+        self._peers: List[SocketAddress] = peers or []
+
+        # Initialize database
+        self._db = Database(
+            db, fields=DB_FIELDS, models=DB_MODELS, db_dir=datadir)
+
+        self.client: Optional[Client] = None
+        self._client_factory = lambda keys_auth: Client(
+            datadir=datadir,
+            app_config=app_config,
+            config_desc=config_desc,
+            keys_auth=keys_auth,
+            database=self._db,
+            mainnet=mainnet,
+            use_docker_manager=use_docker_manager,
+            use_monitor=use_monitor,
+            use_concent=use_concent,
+            start_geth=start_geth,
+            start_geth_port=start_geth_port,
+            geth_address=geth_address,
+        )
+
+        if password is not None:
+            if not self.set_password(password):
+                raise Exception("Password incorrect")
+
+    def start(self) -> None:
+
         try:
-            if use_rpc:
-                self._setup_rpc()
-                self._start_rpc_router()
+            rpc = self._start_rpc()
+
+            def on_rpc_ready() -> Deferred:
+                terms = self._check_terms()
+                keys = self._start_keys_auth()
+                docker = self._start_docker()
+                return gatherResults([terms, keys, docker], consumeErrors=True)
+            chain_function(rpc, on_rpc_ready).addCallbacks(
+                self._setup_client,
+                self._error('keys or docker'),
+            ).addErrback(self._error('setup client'))
+            self._reactor.run()
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("Application error: %r", exc)
+
+    def set_password(self, password: str) -> bool:
+        logger.info("Got password")
+
+        try:
+            self._keys_auth = KeysAuth(
+                datadir=self._datadir,
+                private_key_name=PRIVATE_KEY,
+                password=password,
+                difficulty=self._config_desc.key_difficulty,
+            )
+        except WrongPassword:
+            logger.info("Password incorrect")
+            return False
+        return True
+
+    def key_exists(self) -> bool:
+        return KeysAuth.key_exists(self._datadir, PRIVATE_KEY)
+
+    def is_mainnet(self) -> bool:
+        return self._mainnet
+
+    def _start_rpc(self) -> Deferred:
+        self.rpc_router = rpc = CrossbarRouter(
+            host=self._config_desc.rpc_address,
+            port=self._config_desc.rpc_port,
+            datadir=self._datadir,
+        )
+        self._reactor.addSystemEventTrigger("before", "shutdown", rpc.stop)
+
+        deferred = rpc.start(self._reactor)
+        return chain_function(deferred, self._start_session)
+
+    def _start_session(self) -> Optional[Deferred]:
+        if not self.rpc_router:
+            self._stop_on_error("rpc", "RPC router is not available")
+            return None
+
+        self.rpc_session = Session(self.rpc_router.address,
+                                   cert_manager=self.rpc_router.cert_manager,
+                                   use_ipv6=self._config_desc.use_ipv6)
+        deferred = self.rpc_session.connect()
+
+        def on_connect(*_):
+            methods = object_method_map(self, NODE_METHOD_MAP)
+            self.rpc_session.add_methods(methods)
+
+            self._rpc_publisher = Publisher(self.rpc_session)
+            StatusPublisher.set_publisher(self._rpc_publisher)
+
+        return deferred.addCallbacks(on_connect, self._error('rpc session'))
+
+    @staticmethod
+    def are_terms_accepted():
+        return TermsOfUse.are_terms_accepted()
+
+    @staticmethod
+    def accept_terms():
+        return TermsOfUse.accept_terms()
+
+    @staticmethod
+    def show_terms():
+        return TermsOfUse.show_terms()
+
+    def _check_terms(self) -> Optional[Deferred]:
+        if not self.rpc_session:
+            self._error("RPC session is not available")
+            return None
+
+        def wait_for_terms():
+            while not self.are_terms_accepted() and self._reactor.running:
+                logger.info(
+                    'Terms of use must be accepted before using Golem. '
+                    'Run `golemcli terms show` to display the terms '
+                    'and `golemcli terms accept` to accept them.')
+                time.sleep(5)
+
+        return threads.deferToThread(wait_for_terms)
+
+    def _start_keys_auth(self) -> Optional[Deferred]:
+        if not self.rpc_session:
+            self._error("RPC session is not available")
+            return None
+
+        def create_keysauth():
+            # If keys_auth already exists it means we used command line flag
+            # and don't need to inform client about required password
+            if self._keys_auth is not None:
+                return
+
+            if self.key_exists():
+                event = 'get_password'
+                logger.info("Waiting for password to unlock the account")
             else:
-                self._run()
+                event = 'new_password'
+                logger.info("New account, need to create new password")
 
-            reactor.run()
-        except Exception as exc:
-            self.logger.error("Application error: {}".format(exc))
-        finally:
-            self.client.quit()
+            while self._keys_auth is None and self._reactor.running:
+                StatusPublisher.publish(Component.client, event, Stage.pre)
+                time.sleep(5)
 
-    def _run(self, *_):
-        if self.client.use_docker_machine_manager:
-            self._setup_docker()
+            StatusPublisher.publish(Component.client, event, Stage.post)
+
+        return threads.deferToThread(create_keysauth)
+
+    def _start_docker(self) -> Optional[Deferred]:
+        if not self._use_docker_manager:
+            return None
+
+        def start_docker():
+            DockerManager.install(self._config_desc).check_environment()  # noqa pylint: disable=no-member
+
+        return threads.deferToThread(start_docker)
+
+    def _setup_client(self, *_) -> None:
+        if not self.rpc_session:
+            self._stop_on_error("rpc", "RPC session is not available")
+            return
+
+        if not self._keys_auth:
+            self._error("KeysAuth is not available")
+            return
+
+        self.client = self._client_factory(self._keys_auth)
+        self._reactor.addSystemEventTrigger("before", "shutdown",
+                                            self.client.quit)
+
+        methods = object_method_map(self.client, CORE_METHOD_MAP)
+        self.rpc_session.add_methods(methods)
+
+        self.client.set_rpc_publisher(self._rpc_publisher)
+
+        async_run(AsyncRequest(self._run),
+                  error=self._error('Cannot start the client'))
+
+    def _run(self, *_) -> None:
+        if not self.client:
+            self._stop_on_error("client", "Client is not available")
+            return
+
         self._setup_apps()
-
         self.client.sync()
 
         try:
@@ -66,88 +255,24 @@ class Node(object):
             for peer in self._peers:
                 self.client.connect(peer)
         except SystemExit:
-            from twisted.internet import reactor
-            reactor.callFromThread(reactor.stop)
+            self._reactor.callFromThread(self._reactor.stop)
 
-    def _setup_rpc(self):
-        from golem.rpc.router import CrossbarRouter
+    def _setup_apps(self) -> None:
+        if not self.client:
+            self._stop_on_error("client", "Client is not available")
+            return
 
-        config = self.client.config_desc
-        methods = object_method_map(self.client, CORE_METHOD_MAP)
+        apps_manager = AppsManager()
+        apps_manager.load_apps()
 
-        self.rpc_router = CrossbarRouter(host=config.rpc_address,
-                                         port=int(config.rpc_port),
-                                         datadir=self.client.datadir)
-        self.rpc_session = Session(self.rpc_router.address,
-                                   methods=methods)
-
-        self.client.configure_rpc(self.rpc_session)
-
-    def _setup_docker(self):
-        from golem.docker.manager import DockerManager
-
-        docker_manager = DockerManager.install(self.client.config_desc)
-        docker_manager.check_environment()
-
-    def _setup_apps(self):
-        self._apps_manager = AppsManager()
-        self._apps_manager.load_apps()
-
-        for env in self._apps_manager.get_env_list():
+        for env in apps_manager.get_env_list():
             env.accept_tasks = True
             self.client.environments_manager.add_environment(env)
 
-    def _start_rpc_router(self):
-        from twisted.internet import reactor
+    def _error(self, msg: str) -> Callable:
+        return functools.partial(self._stop_on_error, msg)
 
-        reactor.addSystemEventTrigger("before", "shutdown",
-                                      self.client.quit)
-        reactor.addSystemEventTrigger("before", "shutdown",
-                                      self.rpc_router.stop)
-
-        self.rpc_router.start(reactor, self._rpc_router_ready, self._rpc_error)
-
-    def _rpc_router_ready(self, *_):
-        self.rpc_session.connect().addCallbacks(async_callback(self._run),
-                                                self._rpc_error)
-
-    def _rpc_error(self, err):
-        self.logger.error("RPC error: {}".format(err))
-
-
-class OptNode(Node):
-
-    @staticmethod
-    def parse_node_addr(ctx, param, value):
-        del ctx, param
-        if value:
-            try:
-                SocketAddress(value, 1)
-                return value
-            except AddressValueError as e:
-                raise click.BadParameter(
-                    "Invalid network address specified: {}".format(e))
-        return ''
-
-    @staticmethod
-    def parse_rpc_address(ctx, param, value):
-        del ctx, param
-        value = to_unicode(value)
-        if value:
-            try:
-                return SocketAddress.parse(value)
-            except AddressValueError as e:
-                raise click.BadParameter(
-                    "Invalid RPC address specified: {}".format(e))
-
-    @staticmethod
-    def parse_peer(ctx, param, value):
-        del ctx, param
-        addresses = []
-        for arg in value:
-            try:
-                addresses.append(SocketAddress.parse(arg))
-            except AddressValueError as e:
-                raise click.BadParameter(
-                    "Invalid peer address specified: {}".format(e))
-        return addresses
+    def _stop_on_error(self, msg: str, err: Any) -> None:
+        if self._reactor.running:
+            logger.error("Stopping because of %r error: %r", msg, err)
+            self._reactor.callFromThread(self._reactor.stop)

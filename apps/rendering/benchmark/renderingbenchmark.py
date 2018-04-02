@@ -1,9 +1,12 @@
 import logging
 
 import os.path
+import uuid
+
 from PIL import Image
 
 from apps.core.benchmark.benchmarkrunner import CoreBenchmark
+from apps.rendering.resources.utils import handle_image_error
 from apps.rendering.task.renderingtaskstate import RenderingTaskDefinition
 
 logger = logging.getLogger("apps.core")
@@ -23,7 +26,8 @@ class RenderingBenchmark(CoreBenchmark):
         self._task_definition.total_subtasks = 1
         self._task_definition.start_task = 1
         self._task_definition.end_task = 1
-        
+        self._task_definition.task_id = str(uuid.uuid4())
+
         # magic constant obtained experimentally
         self._normalization_constant = 9500
 
@@ -50,19 +54,16 @@ class RenderingBenchmark(CoreBenchmark):
         return True
 
     def verify_img(self, filename):
-        try:
-            image = Image.open(filename)
-        except:
-            logger.warning('Error during image processing:', exc_info=True)
-            return False
-        img_size = image.size
-        image.close()
-        expected = self._task_definition.resolution
-        if tuple(img_size) == tuple(expected):
-            return True
-        logger.warning("Bad resolution\nExpected {}x{}, but got {}x{}".format(expected[0], expected[1], img_size[0], img_size[1]))
+        with handle_image_error(logger):
+            with Image.open(filename) as image:
+                img_size = image.size
+            expected = self._task_definition.resolution
+            if tuple(img_size) == tuple(expected):
+                return True
+            logger.warning("Bad resolution\nExpected %sx%s, but got %sx%s",
+                           expected[0], expected[1], img_size[0], img_size[1])
         return False
-    
+
     def verify_log(self, filename):
         with open(filename, 'r') as f:
             content = f.read()

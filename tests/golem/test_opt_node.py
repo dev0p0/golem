@@ -1,43 +1,49 @@
-from click.testing import CliRunner
-from mock import patch, Mock
+from os import path
+from unittest.mock import patch, Mock, ANY
 
+from click.testing import CliRunner
+import pytest
+from twisted.internet.defer import Deferred
+
+import golem.argsparser as argsparser
+from golem.appconfig import AppConfig
+from golem.clientconfigdescriptor import ClientConfigDescriptor
 from golem.testutils import TempDirFixture
 from golem.tools.ci import ci_skip
 from golem.tools.testwithdatabase import TestWithDatabase
-from golemapp import start, OptNode
+from golemapp import start, Node
 
 
 @ci_skip
 @patch('twisted.internet.iocpreactor', create=True)
+@patch('twisted.internet.kqreactor', create=True)
 @patch('golem.core.common.config_logging')
 class TestNode(TestWithDatabase):
     def setUp(self):
         super(TestNode, self).setUp()
-        self.args = ['--nogui', '--datadir', self.path]
+        self.args = ['--datadir', self.path]
 
     def tearDown(self):
         super(TestNode, self).tearDown()
 
     @patch('twisted.internet.reactor', create=True)
-    def test_help(self, mock_reactor, *_):
+    def test_should_help_message_be_printed_out(self, mock_reactor, *_):
         runner = CliRunner()
         return_value = runner.invoke(start, ['--help'], catch_exceptions=False)
         self.assertEqual(return_value.exit_code, 0)
         self.assertTrue(return_value.output.startswith('Usage'))
-        mock_reactor.run.assert_not_called()
 
     @patch('twisted.internet.reactor', create=True)
-    def test_wrong_option(self, mock_reactor, *_):
+    def test_wrong_option_should_fail(self, mock_reactor, *_):
         runner = CliRunner()
         return_value = runner.invoke(start, ['--blargh'],
                                      catch_exceptions=False)
         self.assertEqual(return_value.exit_code, 2)
         self.assertTrue(return_value.output.startswith('Error'))
-        mock_reactor.run.assert_not_called()
 
     @patch('twisted.internet.reactor', create=True)
-    @patch('golemapp.OptNode')
-    def test_node_address_valid(self, mock_node, *_):
+    @patch('golemapp.Node')
+    def test_node_address_should_be_passed_to_node(self, mock_node, *_):
         node_address = '1.2.3.4'
 
         runner = CliRunner()
@@ -45,51 +51,313 @@ class TestNode(TestWithDatabase):
         return_value = runner.invoke(start, args, catch_exceptions=False)
         self.assertEqual(return_value.exit_code, 0)
 
-        self.assertGreater(len(mock_node.mock_calls), 0)
+        self.assertEqual(len(mock_node.mock_calls), 2)
         init_call = mock_node.mock_calls[0]
         self.assertEqual(init_call[0], '')  # call name == '' for __init__ call
         init_call_args = init_call[1]
         init_call_kwargs = init_call[2]
         self.assertEqual(init_call_args, ())
-        self.assertEqual(init_call_kwargs.get('node_address'), node_address)
+        self.assertEqual(
+            init_call_kwargs.get('config_desc').node_address,
+            node_address,
+        )
 
-    @patch('golem.node.Node.run')
-    @patch('golem.docker.manager.DockerManager')
-    @patch('twisted.internet.reactor', create=True)
-    @patch('golemapp.delete_reactor')
     @patch('golem.node.Client')
-    def test_node_address_passed_to_client(self, mock_client, *_):
-        """Test that with '--node-address <addr>' arg the client is started with
-        a 'config_desc' arg such that 'config_desc.node_address' is <addr>.
-        """
-        node_address = '1.2.3.4'
-        runner = CliRunner()
-        args = self.args + ['--node-address', node_address]
-        return_value = runner.invoke(start, args, catch_exceptions=False)
-        self.assertEqual(return_value.exit_code, 0)
+    def test_cfg_and_keys_should_be_passed_to_client(self, mock_client, *_):
+        # given
+        cfg = ClientConfigDescriptor()
+        cfg.node_address = '1.2.3.4'
+        keys_auth = object()
 
-        mock_client.assert_called_with(node_address=node_address,
-                                       datadir=self.path,
-                                       transaction_system=True,
-                                       use_docker_machine_manager=True,
-                                       geth_port=None,
-                                       use_monitor=True)
+        # when
+        node = Node(
+            datadir=self.path,
+            app_config=Mock(),
+            config_desc=cfg)
 
-    def test_node_address_invalid(self, *_):
+        node._client_factory(keys_auth)
+
+        # then
+        mock_client.assert_called_with(datadir=self.path,
+                                       app_config=ANY,
+                                       config_desc=cfg,
+                                       keys_auth=keys_auth,
+                                       database=ANY,
+                                       mainnet=False,
+                                       geth_address=None,
+                                       start_geth=False,
+                                       start_geth_port=None,
+                                       use_docker_manager=True,
+                                       use_concent=False,
+                                       use_monitor=False)
+        self.assertEqual(
+            cfg.node_address,
+            mock_client.mock_calls[0][2]['config_desc'].node_address,
+        )
+
+    def test_invalid_node_address_should_fail(self, *_):
         runner = CliRunner()
         args = self.args + ['--node-address', '10.30.10.2555']
         return_value = runner.invoke(start, args, catch_exceptions=False)
         self.assertEqual(return_value.exit_code, 2)
-        self.assertTrue('Invalid value for "--node-address"' in
-                        return_value.output)
+        self.assertIn('Invalid value for "--node-address"', return_value.output)
 
-    def test_node_address_missing(self, *_):
+    def test_missing_node_address_should_fail(self, *_):
         runner = CliRunner()
         return_value = runner.invoke(start, self.args + ['--node-address'])
         self.assertEqual(return_value.exit_code, 2)
         self.assertIn('Error: --node-address', return_value.output)
 
-    @patch('golemapp.OptNode')
+    @patch('twisted.internet.reactor', create=True)
+    @patch('golemapp.Node')
+    def test_geth_address_should_be_passed_to_node(self, mock_node, *_):
+        geth_address = 'http://3.14.15.92:6535'
+
+        runner = CliRunner()
+        args = self.args + ['--geth-address', geth_address]
+        return_value = runner.invoke(start, args, catch_exceptions=False)
+        self.assertEqual(return_value.exit_code, 0)
+
+        mock_node.assert_called_with(datadir=path.join(self.path, 'rinkeby'),
+                                     app_config=ANY,
+                                     config_desc=ANY,
+                                     mainnet=False,
+                                     geth_address=geth_address,
+                                     peers=[],
+                                     start_geth=False,
+                                     start_geth_port=None,
+                                     use_concent=False,
+                                     use_monitor=True,
+                                     password=None)
+
+    @patch('golem.node.Client')
+    def test_geth_address_should_be_passed_to_client(self, mock_client, *_):
+        # given
+        geth_address = 'http://3.14.15.92:6535'
+
+        # when
+        node = Node(
+            datadir=self.path,
+            app_config=Mock(),
+            config_desc=Mock(),
+            geth_address=geth_address)
+
+        node._client_factory(None)
+
+        # then
+        mock_client.assert_called_with(datadir=self.path,
+                                       app_config=ANY,
+                                       config_desc=ANY,
+                                       keys_auth=None,
+                                       database=ANY,
+                                       mainnet=False,
+                                       geth_address=geth_address,
+                                       start_geth=False,
+                                       start_geth_port=None,
+                                       use_docker_manager=True,
+                                       use_concent=False,
+                                       use_monitor=False)
+
+    def test_geth_address_wo_http_should_fail(self, *_):
+        runner = CliRunner()
+        geth_addr = '3.14.15.92'
+        args = self.args + ['--geth-address', geth_addr]
+        return_value = runner.invoke(start, args, catch_exceptions=False)
+        self.assertEqual(return_value.exit_code, 2)
+        self.assertIn('Invalid value for "--geth-address"', return_value.output)
+        self.assertIn('Address without http:// prefix', return_value.output)
+        self.assertIn(geth_addr, return_value.output)
+
+    def test_geth_address_w_wrong_prefix_should_fail(self, *_):
+        runner = CliRunner()
+        geth_addr = 'https://3.14.15.92'
+        args = self.args + ['--geth-address', geth_addr]
+        return_value = runner.invoke(start, args, catch_exceptions=False)
+        self.assertEqual(return_value.exit_code, 2)
+        self.assertIn('Invalid value for "--geth-address"', return_value.output)
+        self.assertIn('Address without http:// prefix', return_value.output)
+        self.assertIn(geth_addr, return_value.output)
+
+    def test_geth_address_wo_port_should_fail(self, *_):
+        runner = CliRunner()
+        geth_addr = 'http://3.14.15.92'
+        args = self.args + ['--geth-address', geth_addr]
+        return_value = runner.invoke(start, args, catch_exceptions=False)
+        self.assertEqual(return_value.exit_code, 2)
+        self.assertIn('Invalid value for "--geth-address"', return_value.output)
+        self.assertIn('Invalid network address specified', return_value.output)
+        self.assertIn(geth_addr[len(geth_addr):], return_value.output)
+
+    def test_geth_address_missing_should_fail(self, *_):
+        runner = CliRunner()
+        return_value = runner.invoke(start, self.args + ['--geth-address'])
+        self.assertEqual(return_value.exit_code, 2)
+        self.assertIn('Error: --geth-address', return_value.output)
+
+    @pytest.mark.skip('Issue #2476')
+    @patch('twisted.internet.reactor', create=True)
+    @patch('golemapp.Node')
+    def test_start_geth_should_be_passed_to_node(self, mock_node, *_):
+        runner = CliRunner()
+        args = self.args + ['--start-geth']
+        return_value = runner.invoke(start, args, catch_exceptions=False)
+        self.assertEqual(return_value.exit_code, 0)
+
+        mock_node.assert_called_with(datadir=path.join(self.path, 'rinkeby'),
+                                     app_config=ANY,
+                                     config_desc=ANY,
+                                     mainnet=False,
+                                     geth_address=None,
+                                     peers=[],
+                                     start_geth=True,
+                                     start_geth_port=None,
+                                     use_concent=False,
+                                     use_monitor=True,
+                                     password=None)
+
+    @patch('golem.node.Client')
+    def test_start_geth_should_be_passed_to_client(self, mock_client, *_):
+        # when
+        node = Node(
+            datadir=self.path,
+            app_config=Mock(),
+            config_desc=Mock(),
+            start_geth=True)
+
+        node._client_factory(None)
+
+        # then
+        mock_client.assert_called_with(datadir=self.path,
+                                       app_config=ANY,
+                                       config_desc=ANY,
+                                       keys_auth=None,
+                                       database=ANY,
+                                       mainnet=False,
+                                       geth_address=None,
+                                       start_geth=True,
+                                       start_geth_port=None,
+                                       use_docker_manager=True,
+                                       use_concent=False,
+                                       use_monitor=False)
+
+    @patch('golemapp.Node')
+    def test_mainnet_should_be_passed_to_node(self, mock_node, *_):
+        # given
+        args = self.args + ['--mainnet']
+
+        # when
+        runner = CliRunner()
+        return_value = runner.invoke(start, args)
+
+        # then
+        assert return_value.exit_code == 0
+        mock_node.assert_called_with(datadir=path.join(self.path, 'mainnet'),
+                                     app_config=ANY,
+                                     config_desc=ANY,
+                                     geth_address=None,
+                                     peers=[],
+                                     start_geth=False,
+                                     start_geth_port=None,
+                                     use_concent=False,
+                                     use_monitor=True,
+                                     password=None,
+                                     mainnet=True)
+
+    @patch('golem.node.Client')
+    def test_mainnet_should_be_passed_to_client(self, mock_client, *_):
+        # when
+        node = Node(
+            datadir=self.path,
+            app_config=Mock(),
+            config_desc=Mock(),
+            mainnet=True)
+
+        node._client_factory(None)
+
+        # then
+        mock_client.assert_called_with(datadir=self.path,
+                                       app_config=ANY,
+                                       config_desc=ANY,
+                                       keys_auth=None,
+                                       database=ANY,
+                                       geth_address=None,
+                                       start_geth=False,
+                                       start_geth_port=None,
+                                       use_docker_manager=True,
+                                       use_concent=False,
+                                       use_monitor=False,
+                                       mainnet=True)
+
+    @pytest.mark.skip('Issue #2476')
+    def test_start_geth_port_wo_param_should_fail(self, *_):
+        runner = CliRunner()
+        return_value = runner.invoke(start, self.args + ['--start-geth-port'])
+        self.assertEqual(return_value.exit_code, 2)
+        self.assertIn('Error: --start-geth-port option requires an argument',
+                      return_value.output)
+
+    @pytest.mark.skip('Issue #2476')
+    def test_start_geth_port_wo_start_geth_should_fail(self, *_):
+        runner = CliRunner()
+        args = self.args + ['--start-geth-port', 1]
+        return_value = runner.invoke(start, args)
+        self.assertEqual(return_value.exit_code, 2)
+        self.assertIn('it makes sense only together with --start-geth',
+                      return_value.output)
+
+    @pytest.mark.skip('Issue #2476')
+    @patch('twisted.internet.reactor', create=True)
+    @patch('golemapp.Node')
+    def test_start_geth_port_should_be_passed_to_node(self, mock_node, *_):
+        port = 27182
+
+        runner = CliRunner()
+        args = self.args + ['--start-geth', '--start-geth-port', port]
+        return_value = runner.invoke(start, args, catch_exceptions=False)
+        self.assertEqual(return_value.exit_code, 0)
+
+        mock_node.assert_called_with(datadir=path.join(self.path, 'rinkeby'),
+                                     app_config=ANY,
+                                     config_desc=ANY,
+                                     mainnet=False,
+                                     geth_address=None,
+                                     peers=[],
+                                     start_geth=True,
+                                     start_geth_port=port,
+                                     use_concent=False,
+                                     use_monitor=True,
+                                     password=None)
+
+    @patch('golem.node.Client')
+    def test_start_geth_port_should_be_passed_to_client(self, mock_client, *_):
+        # given
+        port = 27182
+
+        # when
+        node = Node(
+            datadir=self.path,
+            app_config=Mock(),
+            config_desc=Mock(),
+            start_geth=True,
+            start_geth_port=port)
+
+        node._client_factory(None)
+
+        # then
+        mock_client.assert_called_with(datadir=self.path,
+                                       app_config=ANY,
+                                       config_desc=ANY,
+                                       keys_auth=None,
+                                       database=ANY,
+                                       mainnet=False,
+                                       geth_address=None,
+                                       start_geth=True,
+                                       start_geth_port=port,
+                                       use_docker_manager=True,
+                                       use_concent=False,
+                                       use_monitor=False)
+
+    @patch('golemapp.Node')
     def test_single_peer(self, mock_node, *_):
         mock_node.return_value = mock_node
         addr1 = '10.30.10.216:40111'
@@ -97,11 +365,10 @@ class TestNode(TestWithDatabase):
         runner = CliRunner()
         return_value = runner.invoke(start, self.args + ['--peer', addr1],
                                      catch_exceptions=False)
-        self.assertTrue(mock_node.called)
         self.assertEqual(return_value.exit_code, 0)
-        mock_node.run.assert_called_with(use_rpc=True)
+        # TODO: check peer == [addr1]. issue: #2395
 
-    @patch('golemapp.OptNode')
+    @patch('golemapp.Node')
     def test_many_peers(self, mock_node, *_):
         mock_node.return_value = mock_node
         addr1 = '10.30.10.216:40111'
@@ -112,9 +379,9 @@ class TestNode(TestWithDatabase):
         return_value = runner.invoke(start, args, catch_exceptions=False)
 
         self.assertEqual(return_value.exit_code, 0)
-        mock_node.run.assert_called_with(use_rpc=True)
+        # TODO: check peer == [addr1, addr2]. issue #2395
 
-    @patch('golemapp.OptNode')
+    @patch('golemapp.Node')
     def test_bad_peer(self, *_):
         addr1 = '10.30.10.216:40111'
         runner = CliRunner()
@@ -123,7 +390,7 @@ class TestNode(TestWithDatabase):
         self.assertEqual(return_value.exit_code, 2)
         self.assertTrue('Invalid peer address' in return_value.output)
 
-    @patch('golemapp.OptNode')
+    @patch('golemapp.Node')
     def test_peers(self, mock_node, *_):
         mock_node.return_value = mock_node
         runner = CliRunner()
@@ -135,13 +402,13 @@ class TestNode(TestWithDatabase):
             ], catch_exceptions=False
         )
         self.assertEqual(return_value.exit_code, 0)
-        mock_node.run.assert_called_with(use_rpc=True)
+        # TODO: check peer == [addrs...]. issue: #2395
 
-    @patch('golemapp.OptNode')
+    @patch('golemapp.Node')
     def test_rpc_address(self, *_):
         runner = CliRunner()
 
-        ok_addresses = [ 
+        ok_addresses = [
             ['--rpc-address', '10.30.10.216:61000'],
             ['--rpc-address', '[::ffff:0:0:0]:96'],
             ['--rpc-address', '[2001:db8:85a3:8d3:1319:8a2e:370:7348]:443']
@@ -155,6 +422,7 @@ class TestNode(TestWithDatabase):
         ]
 
         for address in ok_addresses + skip_addresses:
+            AppConfig._AppConfig__loaded_configs = set()
             return_value = runner.invoke(
                 start, self.args + address,
                 catch_exceptions=False
@@ -162,78 +430,247 @@ class TestNode(TestWithDatabase):
             assert return_value.exit_code == 0
 
         for address in bad_addresses:
+            AppConfig._AppConfig__loaded_configs = set()
             return_value = runner.invoke(
                 start, self.args + address,
                 catch_exceptions=False
             )
             assert return_value.exit_code != 0
 
+    @patch('golem.terms.TermsOfUse.are_terms_accepted', return_value=object())
+    def test_are_terms_accepted(self, accepted, *_):
+        self.assertEqual(Node.are_terms_accepted(), accepted.return_value)
 
-def mock_async_callback(call):
-    def callback(result):
-        return call(result)
-    return callback
+    @patch('golem.terms.TermsOfUse.accept_terms')
+    def test_accept_terms(self, accept, *_):
+        Node.accept_terms()
+        accept.assert_called_once_with()
+
+    @patch('golem.terms.TermsOfUse.show_terms', return_value=object())
+    def test_show_terms(self, show, *_):
+        self.assertEqual(Node.show_terms(), show.return_value)
 
 
-@patch('golem.node.async_callback', mock_async_callback)
-@patch('golem.rpc.router.CrossbarRouter', create=True)
+def mock_async_run(req, success=None, error=None):
+    deferred = Deferred()
+    if success:
+        deferred.addCallback(success)
+    if error:
+        deferred.addErrback(error)
+
+    try:
+        result = req.method(*req.args, **req.kwargs)
+    except Exception as e:  # pylint: disable=broad-except
+        deferred.errback(e)
+    else:
+        deferred.callback(result)
+
+    return deferred
+
+
+def done_deferred(*_):
+    deferred = Deferred()
+    deferred.callback(True)
+    return deferred
+
+
+def chain_function(_, fn, *args, **kwargs):
+    result = fn(*args, **kwargs)
+    deferred = Deferred()
+    deferred.callback(result)
+    return deferred
+
+
+def set_keys_auth(obj):
+    obj._keys_auth = Mock()
+
+
+@patch('golem.node.Node._start_keys_auth', set_keys_auth)
+@patch('golem.node.Node._start_docker')
+@patch('golem.node.async_run', mock_async_run)
+@patch('golem.node.chain_function', chain_function)
+@patch('golem.node.threads.deferToThread', done_deferred)
+@patch('golem.node.CrossbarRouter', Mock(_start_node=done_deferred))
+@patch('golem.node.Session')
+@patch('golem.node.gatherResults')
 @patch('twisted.internet.reactor', create=True)
 class TestOptNode(TempDirFixture):
 
+    def setUp(self):
+        super().setUp()
+        self.node = None
+
     def tearDown(self):
-        if hasattr(self, 'node'):
+        if self.node.client:
             self.node.client.quit()
-        super(TestOptNode, self).tearDown()
+        if self.node._db:
+            self.node._db.close()
+        super().tearDown()
 
-    def test_start_rpc_router(self, reactor, router, *_):
-        from golem.rpc.session import WebSocketAddress
+    def test_start_rpc_router(self, reactor, *_):
+        # given
+        config_desc = ClientConfigDescriptor()
+        config_desc.rpc_address = '127.0.0.1'
+        config_desc.rpc_port = 12345
 
-        self.node = OptNode(self.path, use_docker_machine_manager=False,
-                            rpc_address='127.0.0.1', rpc_port=12345)
+        # when
+        self.node = Node(datadir=self.path,
+                         app_config=Mock(),
+                         config_desc=config_desc,
+                         use_docker_manager=False)
 
-        config = self.node.client.config_desc
+        self.node._setup_client = Mock()
+        self.node.start()
 
-        router.return_value = router
-        router.address = WebSocketAddress(config.rpc_address,
-                                          config.rpc_port,
-                                          realm='test_realm')
-        self.node._setup_rpc()
-        self.node._start_rpc_router()
-
+        # then
         assert self.node.rpc_router
-        assert self.node.rpc_router.start.called
+        assert self.node.rpc_router.start.called  # noqa pylint: disable=no-member
         assert reactor.addSystemEventTrigger.called
+        assert reactor.addSystemEventTrigger.call_args[0] == (
+            'before', 'shutdown', self.node.rpc_router.stop)
 
-    @patch('golem.docker.image.DockerImage')
-    def test_setup_without_docker(self, *_):
+    @patch('golem.client.EthereumTransactionSystem')
+    def test_start_creates_client(self, _ets, reactor, mock_gather_results, *_):
+        # given
+        config_descriptor = ClientConfigDescriptor()
 
-        self.parsed_peer = OptNode.parse_peer(None, None, ['10.0.0.10:40104'])
-        self.node = OptNode(self.path, use_docker_machine_manager=False,
-                            peers=self.parsed_peer)
+        mock_gather_results.return_value = mock_gather_results
+        mock_gather_results.addCallbacks.side_effect = \
+            lambda callback, _: callback([])
 
-        self.node._setup_docker = Mock()
-        self.node.client.connect = Mock()
-        self.node.client.start = Mock()
-        self.node.client.environments_manager = Mock()
-        self.node.run()
+        # when
+        self.node = Node(datadir=self.path,
+                         app_config=Mock(),
+                         config_desc=config_descriptor,
+                         use_docker_manager=False)
+        self.node.start()
 
-        assert self.node.client.start.called
-        assert self.node._apps_manager is not None
-        assert not self.node._setup_docker.called
-        self.node.client.connect.assert_called_with(self.parsed_peer[0])
+        # then
+        assert self.node.client
+        assert self.node.client.datadir == self.path
+        assert self.node.client.config_desc == config_descriptor
+        assert reactor.addSystemEventTrigger.call_count == 2
+        assert reactor.addSystemEventTrigger.call_args_list[0][0] == (
+            'before', 'shutdown', self.node.rpc_router.stop)
+        assert reactor.addSystemEventTrigger.call_args_list[1][0] == (
+            'before', 'shutdown', self.node.client.quit)
 
-    @patch('golem.docker.image.DockerImage')
-    def test_setup_with_docker(self, docker_manager, *_):
-        docker_manager.return_value = docker_manager
+    @patch('golem.client.EthereumTransactionSystem')
+    @patch('golem.node.Node._run')
+    def test_start_creates_client_and_calls_run(
+            self,
+            mock_run,
+            _ets,
+            reactor,
+            mock_gather_results,
+            mock_session,
+            *_):
+        # given
+        mock_gather_results.return_value = mock_gather_results
+        mock_gather_results.addCallbacks.side_effect = \
+            lambda callback, _: callback([Mock(), None])
 
-        self.node = OptNode(self.path, use_docker_machine_manager=True)
+        mock_session.return_value = mock_session
+        mock_session.connect.return_value = mock_session
+        mock_session.addCallbacks.side_effect = \
+            lambda callback, _: callback(None)
 
-        self.node._setup_docker = Mock()
-        self.node.client.connect = Mock()
-        self.node.client.start = Mock()
-        self.node.client.environments_manager = Mock()
-        self.node.run()
+        # when
+        self.node = Node(datadir=self.path,
+                         app_config=Mock(),
+                         config_desc=(ClientConfigDescriptor()),
+                         use_docker_manager=False)
+        self.node.start()
 
-        assert self.node.client.start.called
-        assert self.node._apps_manager is not None
-        assert self.node._setup_docker.called
+        # then
+        assert self.node.client
+        assert self.node.rpc_session
+        assert self.node.client.rpc_publisher
+        assert self.node.client.rpc_publisher.session == self.node.rpc_session
+        assert self.node.rpc_session.connect.called  # pylint: disable=no-member
+        assert mock_run.called
+        assert reactor.addSystemEventTrigger.call_count == 2
+
+    def test_start_starts_client(
+            self, reactor, mock_gather_results, mock_session, *_):
+
+        # given
+        mock_gather_results.return_value = mock_gather_results
+        mock_gather_results.addCallbacks.side_effect = \
+            lambda callback, _: callback([Mock(), None])
+
+        mock_session.return_value = mock_session
+        mock_session.connect.return_value = mock_session
+        mock_session.addCallbacks.side_effect = \
+            lambda callback, _: callback(None)
+
+        parsed_peer = argsparser.parse_peer(
+            None,
+            None,
+            ['10.0.0.10:40104'],
+        )
+
+        # when
+        self.node = Node(datadir=self.path,
+                         app_config=Mock(),
+                         config_desc=ClientConfigDescriptor(),
+                         peers=parsed_peer,
+                         use_docker_manager=False)
+
+        self.node._client_factory = Mock()
+        self.node._setup_apps = Mock()
+
+        self.node.start()
+
+        # then
+        assert self.node._setup_apps.called
+        assert self.node.client.sync.called
+        assert self.node.client.start.call_count == 1
+        self.node.client.connect.assert_called_with(parsed_peer[0])
+        assert reactor.addSystemEventTrigger.call_count == 2
+
+    def test_is_mainnet(self, *_):
+        self.node = Node(datadir=self.path,
+                         app_config=Mock(),
+                         config_desc=ClientConfigDescriptor(),
+                         use_docker_manager=False)
+        assert not self.node.is_mainnet()
+
+    @patch('golem.node.Session')
+    def test_start_session(self, *_):
+        self.node = Node(datadir=self.path,
+                         app_config=Mock(),
+                         config_desc=ClientConfigDescriptor(),
+                         use_docker_manager=False)
+
+        self.node.rpc_router = Mock()
+
+        self.node._start_session()
+        assert self.node.rpc_session.connect.called  # noqa # pylint: disable=no-member
+
+    def test_start_session_failure(self, reactor, *_):
+        self.node = Node(datadir=self.path,
+                         app_config=Mock(),
+                         config_desc=ClientConfigDescriptor(),
+                         use_docker_manager=False)
+        self.node.rpc_router = None
+
+        assert self.node._start_session() is None
+        reactor.callFromThread.assert_called_with(reactor.stop)
+
+    def test_error(self, reactor, *_):
+        import functools
+        reactor.running = True
+
+        self.node = Node(datadir=self.path,
+                         app_config=Mock(),
+                         config_desc=ClientConfigDescriptor(),
+                         use_docker_manager=False)
+
+        error = self.node._error('any')
+        assert not reactor.callFromThread.called
+        assert isinstance(self.node._error('any'), functools.partial)
+
+        error_result = error('error message')
+        assert reactor.callFromThread.called
+        assert error_result is None

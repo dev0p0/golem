@@ -1,8 +1,13 @@
+import binascii
 import logging
 import socket
 import sys
 
-import binascii
+import semantic_version
+
+from ethereum.utils import sha3
+
+logger = logging.getLogger(__name__)
 
 
 def find_free_net_port():
@@ -50,7 +55,7 @@ def decode_hex(s):
         if s[0] == b'0' and s[1] == b'x':
             s = s[2:]
         return binascii.unhexlify(s)
-    raise TypeError('Value must be an instance of str or bytes')
+    raise TypeError(f'Value {s} must be an instance of str or bytes: {type(s)}')
 
 
 def encode_hex(b):
@@ -63,21 +68,48 @@ def encode_hex(b):
     raise TypeError('Value must be an instance of str or bytes')
 
 
-def tee_target(prefix, proc, path):
-    """tee emulation for use with threading"""
+def pubkeytoaddr(pubkey: str) -> str:
+    return '0x' + encode_hex(sha3(decode_hex(pubkey))[12:])
+
+
+def tee_target(prefix, proc, input_stream, path, stream):
+    """tee emulation for use with threading
+
+    First stream is open to a file pointed by `path`
+    Second stream is `stream` arg.
+    """
 
     # Using unix `tee` or powershell.exe `Tee-Object` causes problems with
     # error codes etc. Probably could be solved by bash's `set -o pipefail`
     # but emulating tee functionality in a thread seems to raise less porta-
     # bility issues.
-    channels = (
-        ('out: ', proc.stderr, sys.stderr),
-        ('err: ', proc.stdout, sys.stdout),
-    )
     with open(path, 'a') as log_f:
         while proc.poll() is None:
-            for stream_prefix, in_, out in channels:
-                line = in_.readline()
-                if line:
-                    out.write(prefix + str(line))
-                    log_f.write(stream_prefix + str(line))
+            line = input_stream.readline(256)
+            if line:
+                line = line.decode('utf-8', 'replace')
+                if not line.endswith('\n'):
+                    line += '\n'
+                stream.write(prefix + line)
+                log_f.write(prefix + line)
+
+
+def get_version_spec(ours_v: semantic_version.Version) \
+        -> semantic_version.Spec:
+    spec_str = '>={major}.{minor}.0,<{next_minor}'.format(
+        major=ours_v.major,
+        minor=ours_v.minor,
+        next_minor=ours_v.next_minor(),
+    )
+    spec = semantic_version.Spec(spec_str)
+    return spec
+
+
+def is_version_compatible(theirs: str,
+                          spec: semantic_version.Spec) -> bool:
+    try:
+        theirs_v = semantic_version.Version(theirs)
+    except ValueError as e:
+        logger.debug("Can't parse version: %r -> %s", theirs, e)
+        return False
+    return theirs_v in spec

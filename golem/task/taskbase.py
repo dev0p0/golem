@@ -1,15 +1,12 @@
 import abc
-import enum
 import logging
 import time
-from typing import List, Tuple, Union, Type
+from typing import List, Type
 
 from apps.core.task.coretaskstate import TaskDefinition, TaskDefaults, Options
+import golem
 from golem.core.simpleserializer import CBORSerializer, DictSerializer
-from golem.core.variables import APP_VERSION
-from golem.docker.image import DockerImage
 from golem.network.p2p.node import Node
-from golem.resource.resource import TaskResourceHeader
 from golem.task.taskstate import TaskState
 
 logger = logging.getLogger("golem.task")
@@ -32,17 +29,13 @@ class TaskTypeInfo(object):
 
 
 # TODO change types to enums - for now it gets
-# evt.comp.task.test.status Error WAMP message serialization error: unsupported type: <enum 'ResultType'> undefined
+# evt.comp.task.test.status Error WAMP message serialization
+# error: unsupported type: <enum 'ResultType'> undefined
+# Issue #2408
 
 class ResultType(object): # class ResultType(Enum):
     DATA = 0
     FILES = 1
-
-
-class ResourceType(object): # class ResourceType(Enum):
-    ZIP = 0
-    PARTS = 1
-    HASHES = 2
 
 
 class TaskHeader(object):
@@ -61,23 +54,21 @@ class TaskHeader(object):
                  subtask_timeout=0.0,
                  resource_size=0,
                  estimated_memory=0,
-                 min_version=APP_VERSION,
-                 max_price=0.0,
-                 docker_images=None,
+                 min_version=golem.__version__,
+                 max_price: int=0,
                  signature=None):
         """
-        :param float max_price: maximum price that this (requestor) node may
+        :param max_price: maximum price that this (requestor) node may
         pay for an hour of computation
         :param docker_images: docker image specification
         """
 
         self.task_id = task_id
-        # TODO Remove task_owner_key_id, task_onwer_address and task_owner_port
         self.task_owner_key_id = task_owner_key_id
         self.task_owner_address = task_owner_address
         self.task_owner_port = task_owner_port
         self.task_owner = task_owner
-        # TODO change last_checking param
+        # TODO change last_checking param. Issue #2407
         self.last_checking = time.time()
         self.deadline = deadline
         self.subtask_timeout = subtask_timeout
@@ -86,7 +77,6 @@ class TaskHeader(object):
         self.environment = environment
         self.estimated_memory = estimated_memory
         self.min_version = min_version
-        self.docker_images = docker_images
         self.max_price = max_price
         self.signature = signature
 
@@ -105,22 +95,31 @@ class TaskHeader(object):
         th.last_checking = time.time()
 
         if isinstance(th.task_owner, dict):
-            th.task_owner = DictSerializer.load(th.task_owner, as_class=Node)
-        if hasattr(th, 'docker_images') and th.docker_images is not None:
-            for i, di in enumerate(th.docker_images):
-                if isinstance(di, dict):
-                    th.docker_images[i] = DictSerializer.load(di, as_class=DockerImage)
+            th.task_owner = Node.from_dict(th.task_owner)
         return th
 
     @classmethod
     def dict_to_binary(cls, dictionary):
+        """ Nullifies the properties not required for signature verification
+        and sorts the task dict representation in order to have the same
+        resulting binary blob after serialization.
+        """
         self_dict = dict(dictionary)
         self_dict.pop('last_checking', None)
         self_dict.pop('signature', None)
 
+        # "port_statuses" is a nested dict and needs to be sorted;
+        # Python < 3.7 does not guarantee the same dict iteration ordering
+        port_statuses = self_dict['task_owner'].get('port_statuses')
+        if isinstance(port_statuses, dict):
+            self_dict['task_owner']['port_statuses'] = \
+                cls._ordered(port_statuses)
+
         self_dict['task_owner'] = cls._ordered(self_dict['task_owner'])
+
         if self_dict.get('docker_images'):
-            self_dict['docker_images'] = [cls._ordered(di) for di in self_dict['docker_images']]
+            self_dict['docker_images'] = [cls._ordered(di) for di
+                                          in self_dict['docker_images']]
 
         return CBORSerializer.dumps(cls._ordered(self_dict))
 
@@ -129,7 +128,7 @@ class TaskHeader(object):
         return sorted(dictionary.items())
 
 
-class TaskBuilder(object):
+class TaskBuilder(abc.ABC):
     def __init__(self):
         pass
 
@@ -139,7 +138,8 @@ class TaskBuilder(object):
 
     @classmethod
     @abc.abstractmethod
-    def build_definition(cls, task_type: TaskTypeInfo, dictionary, minimal=False) -> 'CoreTaskDefinition':
+    def build_definition(cls, task_type: TaskTypeInfo, dictionary,
+                         minimal=False):
         """ Build task defintion from dictionary with described options.
         :param dict dictionary: described all options need to build a task
         :param bool minimal: if this option is set too True, then only minimal
@@ -147,24 +147,6 @@ class TaskBuilder(object):
         all necessary options must be specified in dictionary
         """
         pass
-
-
-class ComputeTaskDef(object):
-    def __init__(self):
-        self.task_id = ""
-        self.subtask_id = ""
-        self.deadline = ""
-        self.src_code = ""
-        self.extra_data = {}
-        self.short_description = ""
-        self.return_address = ""
-        self.return_port = 0
-        self.task_owner = None
-        self.key_id = 0
-        self.working_directory = ""
-        self.performance = 0.0
-        self.environment = ""
-        self.docker_images = None
 
 
 class TaskEventListener(object):
@@ -175,7 +157,7 @@ class TaskEventListener(object):
         pass
 
 
-class Task(metaclass=abc.ABCMeta):
+class Task(abc.ABC):
 
     class ExtraData(object):
         def __init__(self, should_wait=False, ctd=None, **kwargs):
@@ -185,14 +167,14 @@ class Task(metaclass=abc.ABCMeta):
             for key, value in kwargs.items():
                 setattr(self, key, value)
 
-    # TODO why do we need that instead of calling .build() directly?
+    # TODO why do we need that instead of calling .build() directly? issue #2409
     @classmethod
     def build_task(cls, task_builder: TaskBuilder) -> 'Task':
         if not isinstance(task_builder, TaskBuilder):
             raise TypeError("Incorrect 'task_builder' type: {}. Should be: TaskBuilder".format(type(task_builder)))
         return task_builder.build()
 
-    def __init__(self, header: TaskHeader, src_code: str, task_definition: 'CoreTaskDefinition'):
+    def __init__(self, header: TaskHeader, src_code: str, task_definition):
         self.src_code = src_code
         self.header = header
         self.task_definition = task_definition
@@ -273,7 +255,9 @@ class Task(metaclass=abc.ABCMeta):
         return False
 
     @abc.abstractmethod
-    def computation_finished(self, subtask_id, task_result, result_type=ResultType.DATA):
+    def computation_finished(self, subtask_id, task_result,
+                             result_type=ResultType.DATA,
+                             verification_finished=None):
         """ Inform about finished subtask
         :param subtask_id: finished subtask id
         :param task_result: task result, can be binary data or list of files
@@ -346,19 +330,9 @@ class Task(metaclass=abc.ABCMeta):
         """
         pass  # Implement in derived class
 
-    @abc.abstractmethod
-    def get_resources(self,
-                      resource_header: TaskResourceHeader,
-                      resource_type: ResourceType=ResourceType.ZIP,
-                      tmp_dir: str=None) -> Union[None, str, Tuple[TaskResourceHeader, List]]:
-        """ Compare resources that were declared by client in a resource_header and prepare lacking one. Method of
-        preparing resources depends from declared resource_type
-        :param ResourceHeader resource_header: description of resources that computing node already have for this task
-        :param ResourceType resource_type: resource type from resources_types (0 for zip, 1 for hash list)
-        :param str tmp_dir: additional directory that can be used during file transfer
-        :return None | str | (TaskResourceHeader, list): result depends on return on resource_type
-        """
-        return None
+    def get_resources(self) -> list:
+        """ Return list of files that are need to compute this task."""
+        return []
 
     @abc.abstractmethod
     def update_task_state(self, task_state: TaskState):

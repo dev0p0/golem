@@ -1,64 +1,53 @@
 #!/usr/bin/env python
 
-from sys import argv
+import sys
 
 from setuptools import setup
 
 from setup_util.setup_commons import (
-    path, parse_requirements, generate_ui, platform, update_variables,
-    get_version, get_long_description, find_required_packages, PyTest,
-    PyInstaller, move_wheel, print_errors)
+    path, parse_requirements, get_version,
+    get_long_description, find_required_packages, PyInstaller,
+    move_wheel, print_errors, DatabaseMigration)
 from setup_util.taskcollector_builder import TaskCollectorBuilder
 
 from golem.docker.manager import DockerManager
 from golem.tools.ci import in_appveyor, in_travis
 
-building_wheel = 'bdist_wheel' in argv
-building_binary = 'pyinstaller' in argv
+building_wheel = 'bdist_wheel' in sys.argv
+building_binary = 'pyinstaller' in sys.argv
+building_migration = 'migration' in sys.argv
 
 directory = path.abspath(path.dirname(__file__))
 requirements, dependencies = parse_requirements(directory)
 task_collector_err = TaskCollectorBuilder().build()
 
-if building_wheel or building_binary:
-    ui_err = generate_ui()
-
-update_variables()
-
 setup(
     name='golem',
     version=get_version(),
-    platforms=platform,
+    platforms=sys.platform,
     description='Global, open sourced, decentralized supercomputer',
     long_description=get_long_description(directory),
     url='https://golem.network',
     author='Golem Team',
-    author_email='contact@golemproject.net',
+    author_email='contact@golem.network',
     license="GPL-3.0",
     classifiers=[
         'Development Status :: 3 - Alpha',
         'Intended Audience :: Developers',
         'License :: OSI Approved :: GNU General Public License v3 (GPLv3)',
         'Natural Language :: English',
-        'Programming Language :: Python :: 2.7',
+        'Programming Language :: Python :: 3.6',
     ],
     zip_safe=False,
     keywords='golem',
     packages=find_required_packages(),
     install_requires=requirements,
     dependency_links=dependencies,
-    # @todo remove test dependencies from requirements.txt and add here
-    # extras_require={
-    #     'dev': ['check-manifest'],
-    #     'test': ['coverage'],
-    # },
     include_package_data=True,
     cmdclass={
-        'test': PyTest,
-        'pyinstaller': PyInstaller
+        'pyinstaller': PyInstaller,
+        'migration': DatabaseMigration
     },
-    test_suite='tests',
-    tests_require=['mock', 'pytest'],
     entry_points={
         'gui_scripts': [
             'golemapp = golemapp:start',
@@ -70,6 +59,9 @@ setup(
     data_files=[
         (path.normpath('../../'), [
             'golemapp.py', 'golemcli.py', 'loggingconfig.py'
+        ]),
+        (path.normpath('../../golem/'), [
+            path.normpath('golem/TERMS.html'),
         ]),
         (path.normpath('../../golem/apps'), [
             path.normpath('apps/registered.ini'),
@@ -95,15 +87,6 @@ setup(
         (path.normpath('../../golem/apps/dummy/test_data'), [
             path.normpath('apps/dummy/test_data/in.data')
         ]),
-        (path.normpath('../../golem/gui/view/'), [
-            path.normpath('gui/view/nopreview.png')
-        ]),
-        (path.normpath('../../golem/gui/view/img'), [
-            path.normpath('gui/view/img/' + f) for f in [
-                'favicon-256x256.png', 'favicon-48x48.png', 'favicon-32x32.png',
-                'settings.png', 'task.png', 'user.png', 'new.png', 'eye.png'
-            ]
-        ]),
     ]
 )
 
@@ -111,10 +94,13 @@ if not (in_appveyor() or in_travis() or
         building_wheel or building_binary):
     DockerManager.pull_images()
 
-if not (building_wheel or building_binary):
-    ui_err = generate_ui()
-elif building_wheel:
+if building_wheel:
     move_wheel()
 
+if not building_migration:
+    from golem.database.migration.create import latest_migration_exists
+    if not latest_migration_exists():
+        raise RuntimeError("Database schema error: latest migration script "
+                           "does not exist")
 
-print_errors(ui_err, task_collector_err)
+print_errors(task_collector_err)

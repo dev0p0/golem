@@ -1,76 +1,35 @@
 import datetime
+import inspect
 import json
-import logging
+import pickle
+
+import peewee
 from enum import Enum
-from os import path
 # Type is used for old-style (pre Python 3.6) type annotation
 from typing import Optional, Type  # pylint: disable=unused-import
 
-
+import sys
 from ethereum.utils import denoms
+from golem_messages import message
 from peewee import (BooleanField, CharField, CompositeKey, DateTimeField,
                     FloatField, IntegerField, Model, SmallIntegerField,
-                    SqliteDatabase, TextField)
+                    TextField, BlobField)
 
 from golem.core.simpleserializer import DictSerializable
+from golem.database import GolemSqliteDatabase
 from golem.network.p2p.node import Node
 from golem.ranking.helper.trust_const import NEUTRAL_TRUST
 from golem.utils import decode_hex, encode_hex
 
-log = logging.getLogger('golem.db')
-
 # Indicates how many KnownHosts can be stored in the DB
 MAX_STORED_HOSTS = 4
-db = SqliteDatabase(None, threadlocals=True,
-                    pragmas=(('foreign_keys', True), ('busy_timeout', 30000)))
 
-
-class Database:
-    # Database user schema version, bump to recreate the database
-    SCHEMA_VERSION = 5
-
-    def __init__(self, datadir):
-        # TODO: Global database is bad idea. Check peewee for other solutions.
-        self.db = db
-        db.init(path.join(datadir, 'golem.db'))
-        db.connect()
-        self.create_database()
-
-    @staticmethod
-    def _get_user_version() -> int:
-        return int(db.execute_sql('PRAGMA user_version').fetchone()[0])
-
-    @staticmethod
-    def _set_user_version(version: int) -> None:
-        db.execute_sql('PRAGMA user_version = {}'.format(version))
-
-    @staticmethod
-    def create_database() -> None:
-        tables = [
-            Account,
-            ExpectedIncome,
-            GlobalRank,
-            HardwarePreset,
-            Income,
-            KnownHosts,
-            LocalRank,
-            NeighbourLocRank,
-            Payment,
-            Stats,
-            TaskPreset,
-            Performance,
-        ]
-        version = Database._get_user_version()
-        if version != Database.SCHEMA_VERSION:
-            log.info("New database version {}, previous {}".format(
-                Database.SCHEMA_VERSION, version))
-            db.drop_tables(tables, safe=True)
-            Database._set_user_version(Database.SCHEMA_VERSION)
-        db.create_tables(tables, safe=True)
-
-    def close(self):
-        if not self.db.is_closed():
-            self.db.close()
+# TODO: migrate to golem.database. issue #2415
+db = GolemSqliteDatabase(None, threadlocals=True,
+                         pragmas=(
+                             ('foreign_keys', True),
+                             ('busy_timeout', 1000),
+                             ('journal_mode', 'WAL')))
 
 
 class BaseModel(Model):
@@ -79,6 +38,18 @@ class BaseModel(Model):
 
     created_date = DateTimeField(default=datetime.datetime.now)
     modified_date = DateTimeField(default=datetime.datetime.now)
+
+    def refresh(self):
+        """
+        https://github.com/coleifer/peewee/issues/686#issuecomment-130548126
+        :return: Refreshed version of the object retrieved from db
+        """
+        return type(self).get(self._pk_expr())
+
+
+class GenericKeyValue(BaseModel):
+    key = CharField(primary_key=True)
+    value = CharField(null=True)
 
 
 ##################
@@ -96,7 +67,7 @@ class RawCharField(CharField):
         return decode_hex(value)
 
 
-class BigIntegerField(CharField):
+class HexIntegerField(CharField):
     """ Standard Integer field is limited to 2^63-1. This field extends the
         range by storing the numbers as hex-encoded char strings.
     """
@@ -122,6 +93,22 @@ class EnumField(IntegerField):
         if not isinstance(value, self.enum_type):
             raise TypeError("Expected {} type".format(self.enum_type.__name__))
         return value.value  # Get the integer value of an enum.
+
+    def python_value(self, value):
+        return self.enum_type(value)
+
+
+class StringEnumField(CharField):
+    """ Database field that maps enum types to strings."""
+
+    def __init__(self, enum_type, *args, max_length=255, **kwargs):
+        super().__init__(max_length, *args, **kwargs)
+        self.enum_type = enum_type
+
+    def db_value(self, value):
+        if not isinstance(value, self.enum_type):
+            raise TypeError("Expected {} type".format(self.enum_type.__name__))
+        return value.value  # Get the string value of an enum.
 
     def python_value(self, value):
         return self.enum_type(value)
@@ -155,6 +142,15 @@ class PaymentStatus(Enum):
     awaiting = 1  # Created but not introduced to the payment network.
     sent = 2  # Sent to the payment network.
     confirmed = 3  # Confirmed on the payment network.
+
+    # Workarounds for peewee_migration
+
+    def __repr__(self):
+        return '{}.{}'.format(self.__class__.__name__, self.name)
+
+    @property
+    def __self__(self):
+        return self
 
 
 class PaymentDetails(DictSerializable):
@@ -203,16 +199,21 @@ class PaymentDetailsField(DictSerializableJSONField):
     objtype = PaymentDetails
 
 
+class PaymentStatusField(EnumField):
+    """ Database field that stores PaymentStatusField objects as integers. """
+    def __init__(self, *args, **kwargs):
+        super().__init__(PaymentStatus, *args, **kwargs)
+
+
 class Payment(BaseModel):
     """ Represents payments that nodes on this machine make to other nodes
     """
     subtask = CharField(primary_key=True)
-    status = EnumField(enum_type=PaymentStatus,
-                       index=True,
-                       default=PaymentStatus.awaiting)
+    status = PaymentStatusField(index=True, default=PaymentStatus.awaiting)
     payee = RawCharField()
-    value = BigIntegerField()
+    value = HexIntegerField()
     details = PaymentDetailsField()
+    processed_ts = IntegerField(null=True)
 
     def __init__(self, *args, **kwargs):
         super(Payment, self).__init__(*args, **kwargs)
@@ -223,54 +224,36 @@ class Payment(BaseModel):
     def __repr__(self) -> str:
         tx = self.details.tx
         bn = self.details.block_number
-        return "<Payment sbid:{!r} v:{:.3f} s:{!r} tx:{!r} bn:{!r}>"\
+        return "<Payment sbid:{!r} v:{:.3f} s:{!r} tx:{!r} bn:{!r} ts:{!r}>"\
             .format(
                 self.subtask,
                 float(self.value) / denoms.ether,
                 self.status,
                 tx,
-                bn
+                bn,
+                self.processed_ts
             )
-
-    def get_sender_node(self) -> Optional[Node]:
-        return self.details.node_info
-
-
-class ExpectedIncome(BaseModel):
-    sender_node = CharField()
-    sender_node_details = NodeField()
-    task = CharField()
-    subtask = CharField()
-    value = BigIntegerField()
-
-    def __repr__(self):
-        return "<ExpectedIncome: {!r} v:{:.3f}>"\
-            .format(self.subtask, self.value)
-
-    def get_sender_node(self):
-        return self.sender_node_details
 
 
 class Income(BaseModel):
-    """Payments received from other nodes."""
     sender_node = CharField()
-    task = CharField()
     subtask = CharField()
-    transaction = CharField()
-    block_number = BigIntegerField()
-    value = BigIntegerField()
+    value = HexIntegerField()
+    accepted_ts = IntegerField(null=True)
+    transaction = CharField(null=True)
+    overdue = BooleanField(default=False)
 
     class Meta:
         database = db
         primary_key = CompositeKey('sender_node', 'subtask')
 
     def __repr__(self):
-        return "<Income: {!r} v:{:.3f} tid:{!r} bn:{!r}>"\
+        return "<Income: {!r} v:{:.3f} accepted_ts:{!r} tid:{!r}>"\
             .format(
                 self.subtask,
                 self.value,
+                self.accepted_ts,
                 self.transaction,
-                self.block_number
             )
 
 
@@ -404,7 +387,7 @@ class Performance(BaseModel):
         database = db
 
     @classmethod
-    def update_or_create(cl, env_id, performance):
+    def update_or_create(cls, env_id, performance):
         try:
             perf = Performance.get(Performance.environment_id == env_id)
             perf.value = performance
@@ -412,3 +395,64 @@ class Performance(BaseModel):
         except Performance.DoesNotExist:
             perf = Performance(environment_id=env_id, value=performance)
             perf.save()
+
+
+##################
+# MESSAGE MODELS #
+##################
+
+
+class Actor(Enum):
+    Concent = "concent"
+    Requestor = "requestor"
+    Provider = "provider"
+
+
+class ActorField(StringEnumField):
+    """ Database field that stores Actor objects as strings. """
+    def __init__(self, *args, **kwargs):
+        super().__init__(Actor, *args, **kwargs)
+
+
+class NetworkMessage(BaseModel):
+    local_role = ActorField(null=False)
+    remote_role = ActorField(null=False)
+
+    # The node we are exchanging messages with. Can be a receiver or a sender,
+    # which is determined by local_role, remote_role and msg_cls.
+    node = CharField(null=False)
+    task = CharField(null=True, index=True)
+    subtask = CharField(null=True, index=True)
+
+    msg_date = DateTimeField(null=False)
+    msg_cls = CharField(null=False)
+    msg_data = BlobField(null=False)
+
+    def as_message(self) -> message.Message:
+        msg = pickle.loads(self.msg_data)
+        return msg
+
+
+def collect_db_models(module: str = __name__):
+    return inspect.getmembers(
+        sys.modules[module],
+        lambda cls: (
+            inspect.isclass(cls) and
+            issubclass(cls, BaseModel) and
+            cls is not BaseModel
+        )
+    )
+
+
+def collect_db_fields(module: str = __name__):
+    return inspect.getmembers(
+        sys.modules[module],
+        lambda cls: (
+            inspect.isclass(cls) and
+            issubclass(cls, peewee.Field)
+        )
+    )
+
+
+DB_FIELDS = [cls for _, cls in collect_db_fields()]
+DB_MODELS = [cls for _, cls in collect_db_models()]
